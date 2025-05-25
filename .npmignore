@@ -1,0 +1,5 @@
+!dist
+/cli
+/prisma/blocks
+/node_modules
+/runtime
