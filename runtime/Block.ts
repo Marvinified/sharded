@@ -273,9 +273,17 @@ export class Block {
                         ? parseInt(process.env.REDIS_PORT)
                         : 6379,
                     password: process.env.REDIS_PASSWORD,
+                    retryStrategy: function (times: number) {
+                        return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                    },
+                    enableOfflineQueue: false,
                 },
                 defaultJobOptions: {
                     removeOnComplete: true,
+                    removeOnFail: {
+                        count: 1000,
+                        age: 24 * 3600, // keep up to 24 hours
+                    },
                     backoff: {
                         type: 'fixed',
                         delay: 0,
@@ -283,6 +291,12 @@ export class Block {
                     attempts: 3,
                 },
             })
+
+            queue.on("error", (error) => {
+                console.error(`[sharded][blocks] Unhandled error in block_queue ${queue.name}`, error);
+            });
+
+
 
             try {
                 // Ensure connection is established
@@ -305,8 +319,28 @@ export class Block {
                         ? parseInt(process.env.REDIS_PORT)
                         : 6379,
                     password: process.env.REDIS_PASSWORD,
+                    retryStrategy: function (times: number) {
+                        return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                    },
+                    maxRetriesPerRequest: null,
+                    enableOfflineQueue: true,
                 },
             })
+
+
+            worker.on("error", (error) => {
+                console.error("[sharded] Unhandled error in block sync worker", error);
+            });
+
+            // Handling unexpected shutdowns
+            process.on('SIGINT', () => {
+                console.log(`[sharded] Received SIGINT, shutting down block sync worker`);
+                worker.close();
+            });
+            process.on('SIGTERM', () => {
+                console.log(`[sharded] Received SIGTERM, shutting down block sync worker`);
+                worker.close();
+            });
 
             try {
                 // Ensure worker is ready
@@ -672,8 +706,16 @@ export class Block {
                     ? parseInt(process.env.REDIS_PORT)
                     : 6379,
                 password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                enableOfflineQueue: false,
             },
         })
+
+        queue.on("error", (error) => {
+            console.error(`[sharded][watch] Unhandled error block invalidation queue: ${queue.name}`, error);
+        });
 
         await queue.waitUntilReady()
 
@@ -686,7 +728,7 @@ export class Block {
             },
         })
 
-        new Worker(queue.name, async (job: Job<{ ttl: number }>) => {
+        const worker = new Worker(queue.name, async (job: Job<{ ttl: number }>) => {
             const lastSeen = await Block.redis?.hgetall("last_seen")
             for (const blockId in lastSeen) {
                 const lastSeenTime = parseInt(lastSeen[blockId])
@@ -705,6 +747,11 @@ export class Block {
                     ? parseInt(process.env.REDIS_PORT)
                     : 6379,
                 password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                maxRetriesPerRequest: null,
+                enableOfflineQueue: true,
             },
         })
     }
