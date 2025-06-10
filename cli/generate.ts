@@ -87,6 +87,7 @@ ${(models === "*" ? Array.from(modelsMap.keys()) : models)
             let converted = line
               .replace(/@db\.ObjectId/g, '')
               .replace(/@db\.String/g, '')
+              .replace(/@db\.Timestamptz(\(\d+\))?/g, '')
               .replace(/@default\(auto\(\)\)/g, '@default(uuid())')
               .trim();
             
