@@ -7,6 +7,103 @@ interface GenerateSubsetSchemaConfig {
   models: string[] | "*";
 }
 
+function cleanAttribute(attr: string): string {
+  // Handle relation attributes
+  if (attr.includes('@relation')) {
+    const parts = attr.split('@relation')[1].trim();
+    // Remove any trailing comma before the closing parenthesis
+    const cleanedParts = parts.replace(/,\s*\)/g, ')');
+    const args = cleanedParts.slice(1, -1).split(',').map(p => p.trim()).filter(p => p);
+    return `@relation(${args.join(', ')})`;
+  }
+  // Handle index attributes
+  if (attr.includes('@@index')) {
+    const parts = attr.split('@@index')[1].trim();
+    // Remove any trailing comma before the closing parenthesis
+    const cleanedParts = parts.replace(/,\s*\)/g, ')');
+    const args = cleanedParts.slice(1, -1).split(',').map(p => p.trim()).filter(p => p);
+    return `@@index(${args.join(', ')})`;
+  }
+  return attr;
+}
+
+function parseModelContent(content: string): { fields: string[], relations: Map<string, string[]> } {
+  const lines = content.split('\n');
+  const fields: string[] = [];
+  const relations = new Map<string, string[]>();
+  let currentField = '';
+  let currentFieldLine = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    
+    // Skip empty lines and comments
+    if (!line || line.startsWith('//')) {
+      continue;
+    }
+
+    // Process the line for SQLite compatibility
+    let processed = line
+      .replace(/@db\.ObjectId/g, '')
+      .replace(/@db\.String/g, '')
+      .replace(/@db\.Timestamptz(\(\d+\))?/g, '')
+      .replace(/@default\(auto\(\)\)/g, '@default(uuid())')
+      .replace(/@db\.Uuid/g, '')
+      .replace(/@db\.Date/g, '')
+      .replace(/@db\.Decimal/g, '')
+      .replace(/map: "[^"]+"/g, '')
+      .replace(/String\[\]/g, 'String')
+      .replace(/@default\(\[[^\]]+\]\)/g, '@default("[]")')
+      .replace(/@default\(\[\]\)/g, '@default("[]")')
+      // SQLite compatibility for gen_random_uuid()
+      .replace(/@default\(dbgenerated\("gen_random_uuid\(\)"\)\)/g, '@default(uuid())')
+      // Remove any other dbgenerated defaults
+      .replace(/@default\(dbgenerated\("[^"]+"\)\)/g, '');
+
+    // If this is a field definition (not a model or enum)
+    if (!processed.startsWith('model') && !processed.startsWith('enum')) {
+      // Extract the field name (everything before the first space)
+      const fieldName = processed.split(' ')[0];
+      currentField = fieldName;
+      currentFieldLine = processed;
+      fields.push(currentFieldLine);
+    }
+
+    // If line starts with @relation or @@index, add it to the current field's relations
+    if (line.startsWith('@relation') || line.startsWith('@@index')) {
+      if (currentField) {
+        const fieldRelations = relations.get(currentField) || [];
+        // Clean the relation/index attribute by removing trailing commas
+        const cleanedAttr = line.replace(/,\s*\)/g, ')');
+        fieldRelations.push(cleanedAttr);
+        relations.set(currentField, fieldRelations);
+      }
+    }
+  }
+
+  return { fields, relations };
+}
+
+function processModelContent(content: string): string {
+  const { fields, relations } = parseModelContent(content);
+  
+  // Combine fields with their relations
+  const processedLines = fields.map(field => {
+    const fieldName = field.split(' ')[0];
+    const fieldRelations = relations.get(fieldName) || [];
+    
+    // If the field already has relations in its definition, don't add them again
+    if (field.includes('@relation') || field.includes('@@index')) {
+      return field;
+    }
+    
+    // Add relations on the same line as the field
+    return field + (fieldRelations.length > 0 ? ' ' + fieldRelations.join(' ') : '');
+  });
+
+  return processedLines.join('\n');
+}
+
 export async function generate(config: GenerateSubsetSchemaConfig) {
   const { schema, models } = config;
   const output = join('.', 'prisma', 'blocks')
@@ -34,8 +131,6 @@ export async function generate(config: GenerateSubsetSchemaConfig) {
 
   const mainSchema = readFileSync(schema, 'utf-8').replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
 
-
-
   // Extract model definitions, enums, and other schema elements
   const modelRegex = /model\s+(\w+)\s*{([^}]+)}/g;
   const enumRegex = /enum\s+(\w+)\s*{([^}]+)}/g;
@@ -58,7 +153,7 @@ export async function generate(config: GenerateSubsetSchemaConfig) {
   }
 
   // Create subset schema
-  const subsetSchema = `
+  let subsetSchema = `
 generator client {
   provider = "prisma-client-js"
   output   = "./generated/block"
@@ -80,24 +175,7 @@ ${(models === "*" ? Array.from(modelsMap.keys()) : models)
           throw new Error(`Model ${modelName} not found in schema`);
         }
 
-        // Convert ObjectId and other MongoDB types to String
-        const convertedContent = modelContent
-          .split('\n')
-          .map(line => {
-            let converted = line
-              .replace(/@db\.ObjectId/g, '')
-              .replace(/@db\.String/g, '')
-              .replace(/@db\.Timestamptz(\(\d+\))?/g, '')
-              .replace(/@default\(auto\(\)\)/g, '@default(uuid())')
-              .trim();
-            
-            if (converted && !converted.startsWith('//')) {
-              return converted;
-            }
-            return line.trim();
-          })
-          .filter(line => line)
-          .join('\n');
+        const convertedContent = processModelContent(modelContent);
 
         return `model ${modelName} {
 ${convertedContent}
@@ -105,6 +183,12 @@ ${convertedContent}
       })
       .join('\n\n')}
 `;
+
+  // Clean trailing commas in relations and indexes
+  subsetSchema = subsetSchema
+    .replace(/,\s*\)/g, ')')  // Remove trailing commas in relations
+    .replace(/,\s*}/g, '}')   // Remove trailing commas in model definitions
+    .replace(/,\s*]/g, ']');  // Remove trailing commas in arrays
 
   // Write subset schema
   const schemaPath = join(output, 'block.prisma');
@@ -114,8 +198,6 @@ ${convertedContent}
 
   // Generate Prisma client and create template database
   try {
-    // Change to output directory
-
     console.log("Exists", existsSync(schemaPath))
 
     // Run Prisma commands with explicit schema path
