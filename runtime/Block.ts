@@ -465,6 +465,14 @@ export class Block {
             query: {
                 $allModels: {
                     async create({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 create', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         // Execute in block DB first to get the ID
                         const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
@@ -484,6 +492,14 @@ export class Block {
                     },
 
                     async createMany({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 createMany', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         // tranform and include the ids
                         const data = Array.isArray(args.data)
                             ? args.data.map((item) => ({
@@ -508,6 +524,14 @@ export class Block {
                     },
 
                     async update({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 update', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         await Block.queue_operation(blockId, {
                             operation,
                             model,
@@ -519,28 +543,52 @@ export class Block {
                     },
 
                     async updateMany({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 updateMany', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
+                        const result = await query(args)
                         await Block.queue_operation(blockId, {
                             operation,
                             model,
                             args,
                         })
-                        const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
                         return result
                     },
 
                     async upsert({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 upsert', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
+                        const result = await query(args)
                         await Block.queue_operation(blockId, {
                             operation,
                             model,
                             args,
                         })
-                        const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
                         return result
                     },
 
                     async delete({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 delete', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         // Execute the delete in block DB first
                         const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
@@ -554,6 +602,14 @@ export class Block {
                     },
 
                     async deleteMany({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 deleteMany', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         // Execute the delete in block DB first
                         const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
@@ -638,18 +694,42 @@ export class Block {
 
                     // these need to be pulled directly from the main client, Ideally you don't want to do this
                     async count({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 count', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
                         return result
                     },
 
                     async aggregate({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 aggregate', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
                         return result
                     },
 
                     async groupBy({ operation, args, model, query }) {
+                        if (Block.debug) {
+                            console.log('🔄 groupBy', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
                         const result = await query(args)
                         Block.redis?.hset("last_seen", blockId, Date.now())
                         return result
@@ -719,16 +799,16 @@ export class Block {
 
         await queue.waitUntilReady()
 
-        await queue.upsertJobScheduler("check-invalidation-every-10-seconds", {
+        await queue.upsertJobScheduler("check-invalidation-every", {
             every: options.interval ?? 10000,
         }, {
-            name: "check-invalidation-every-10-seconds",
+            name: "check-invalidation-every",
             data: {
                 ttl: options.ttl ?? 60,
             },
         })
 
-        const worker = new Worker(queue.name, async (job: Job<{ ttl: number }>) => {
+        new Worker(queue.name, async (job: Job<{ ttl: number }>) => {
             const lastSeen = await Block.redis?.hgetall("last_seen")
             for (const blockId in lastSeen) {
                 const lastSeenTime = parseInt(lastSeen[blockId])
