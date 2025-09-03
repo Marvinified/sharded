@@ -76,6 +76,10 @@ export class Block {
     private static locks = new Map<string, Promise<void>>()
     private static redis: Redis | null = null
     private static debug = false
+    // Reference counting for active operations
+    private static activeOperations = new Map<string, number>()
+    // Track blocks currently being invalidated
+    private static invalidatingBlocks = new Set<string>()
 
     static async create<T>(config: BlockConfig<T>) {
         const node = config.node ?? 'worker'
@@ -245,7 +249,67 @@ export class Block {
 
         // Tracking block for invalidation
         Block.redis.hset("last_seen", config.blockId, Date.now())
-        return Block.blockClientsWithHooks.get(config.blockId)! as T
+        
+        // Safe retrieval with race condition handling
+        const block = await Block.safeGetBlock<T>(config.blockId)
+        if (!block) {
+            throw new Error(`Failed to create or retrieve block: ${config.blockId}. It may have been invalidated during creation.`)
+        }
+        
+        return block
+    }
+
+    /**
+     * Safely retrieve a block with retry logic to handle race conditions
+     */
+    static async safeGetBlock<T>(blockId: string, maxRetries = 3): Promise<T | null> {
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            const block = Block.blockClientsWithHooks.get(blockId)
+            if (block) {
+                // Update last seen before returning
+                Block.redis?.hset("last_seen", blockId, Date.now())
+                return block as T
+            }
+            
+            if (attempt < maxRetries - 1) {
+                // Wait a bit before retrying
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+        }
+        return null
+    }
+
+    /**
+     * Increment the operation count for a block
+     */
+    static incrementOperationCount(blockId: string) {
+        const current = Block.activeOperations.get(blockId) || 0
+        Block.activeOperations.set(blockId, current + 1)
+        if (Block.debug) {
+            console.log(`[Sharded] Operation count for ${blockId}: ${current + 1}`)
+        }
+    }
+
+    /**
+     * Decrement the operation count for a block
+     */
+    static decrementOperationCount(blockId: string) {
+        const current = Block.activeOperations.get(blockId) || 0
+        if (current > 1) {
+            Block.activeOperations.set(blockId, current - 1)
+        } else {
+            Block.activeOperations.delete(blockId)
+        }
+        if (Block.debug) {
+            console.log(`[Sharded] Operation count for ${blockId}: ${Math.max(0, current - 1)}`)
+        }
+    }
+
+    /**
+     * Check if a block can be safely invalidated (no active operations)
+     */
+    static canInvalidate(blockId: string): boolean {
+        return !Block.activeOperations.has(blockId) && !Block.invalidatingBlocks.has(blockId)
     }
 
     static async delete_block(blockId: string) {
@@ -352,7 +416,11 @@ export class Block {
             }
         }
 
-        return Block.blockQueues.get(blockId)!
+        const queue = Block.blockQueues.get(blockId)
+        if (!queue) {
+            throw new Error(`Failed to initialize queue for block ${blockId}`)
+        }
+        return queue
     }
 
     static async sync_operation(
@@ -375,9 +443,12 @@ export class Block {
                 })
             }
 
-            const mainClient = await Block.mainClients.get(job.queueName)
+            const mainClient = Block.mainClients.get(job.queueName)
             if (!mainClient) {
-                throw new Error(`Client for block ${job.queueName} not found`)
+                if (Block.debug) {
+                    console.log(`[Sharded] Main client for block ${job.queueName} not found - block may have been invalidated`)
+                }
+                return // Skip this operation as the block has been invalidated
             }
 
             try {
@@ -428,7 +499,10 @@ export class Block {
     ) {
         const queue = Block.blockQueues.get(blockId)
         if (!queue) {
-            throw new Error(`Queue for block ${blockId} not found`)
+            if (Block.debug) {
+                console.log(`[Sharded] Queue for block ${blockId} not found - block may have been invalidated`)
+            }
+            return // Skip this operation as the block has been invalidated
         }
 
         try {
@@ -465,274 +539,365 @@ export class Block {
             query: {
                 $allModels: {
                     async create({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 create', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        // Execute in block DB first to get the ID
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        // Queue the operation with the result's ID
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args: {
-                                ...args,
-                                data: {
-                                    ...args.data,
-                                    id: result.id,
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 create', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            // Execute in block DB first to get the ID
+                            const result = await query(args)
+                            
+                            // Queue the operation with the result's ID
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args: {
+                                    ...args,
+                                    data: {
+                                        ...args.data,
+                                        id: result.id,
+                                    },
                                 },
-                            },
-                        })
-                        return result
+                            })
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async createMany({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 createMany', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        // tranform and include the ids
-                        const data = Array.isArray(args.data)
-                            ? args.data.map((item) => ({
-                                ...item,
-                                id: item.id ?? crypto.randomUUID(),
-                            }))
-                            : {
-                                ...args.data,
-                                id: args.data.id ?? crypto.randomUUID(),
-                            }
-
-                        args = { ...args, data: data as any }
-
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args,
-                        })
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 createMany', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            // tranform and include the ids
+                            const data = Array.isArray(args.data)
+                                ? args.data.map((item) => ({
+                                    ...item,
+                                    id: item.id ?? crypto.randomUUID(),
+                                }))
+                                : {
+                                    ...args.data,
+                                    id: args.data.id ?? crypto.randomUUID(),
+                                }
+
+                            args = { ...args, data: data as any }
+
+                            const result = await query(args)
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args,
+                            })
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async update({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 update', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args,
-                        })
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 update', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args,
+                            })
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async updateMany({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 updateMany', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args,
-                        })
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 updateMany', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args,
+                            })
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async upsert({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 upsert', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args,
-                        })
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 upsert', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args,
+                            })
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async delete({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 delete', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        // Execute the delete in block DB first
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        // Queue the operation for main DB sync
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args,
-                        })
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 delete', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            // Execute the delete in block DB first
+                            const result = await query(args)
+                            // Queue the operation for main DB sync
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args,
+                            })
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async deleteMany({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 deleteMany', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        // Execute the delete in block DB first
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        // Queue the operation for main DB sync
-                        await Block.queue_operation(blockId, {
-                            operation,
-                            model,
-                            args,
-                        })
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 deleteMany', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            // Execute the delete in block DB first
+                            const result = await query(args)
+                            // Queue the operation for main DB sync
+                            await Block.queue_operation(blockId, {
+                                operation,
+                                model,
+                                args,
+                            })
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async findFirst({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 findFirst', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 findFirst', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async findMany({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 findMany', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 findMany', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async findUnique({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 findUnique', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 findUnique', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async findUniqueOrThrow({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 findUniqueOrThrow', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 findUniqueOrThrow', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async findFirstOrThrow({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 findFirstOrThrow', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 findFirstOrThrow', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     // these need to be pulled directly from the main client, Ideally you don't want to do this
                     async count({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 count', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 count', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async aggregate({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 aggregate', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 aggregate', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
 
                     async groupBy({ operation, args, model, query }) {
-                        if (Block.debug) {
-                            console.log('🔄 groupBy', {
-                                operation,
-                                args,
-                                model,
-                                query,
-                            })
-                        }
-                        const result = await query(args)
+                        Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        return result
+                        
+                        try {
+                            if (Block.debug) {
+                                console.log('🔄 groupBy', {
+                                    operation,
+                                    args,
+                                    model,
+                                    query,
+                                })
+                            }
+                            const result = await query(args)
+                            return result
+                        } finally {
+                            Block.decrementOperationCount(blockId)
+                        }
                     },
                 },
             },
@@ -742,27 +907,81 @@ export class Block {
     }
 
     static async invalidate(blockId: string) {
-        if (Block.debug) {
-            console.log('[Sharded] Destroying block:', blockId)
-        }
-        Block.blockClients.delete(blockId)
-        Block.blockClientsWithHooks.delete(blockId)
-        Block.mainClients.delete(blockId)
-        Block.blockQueues.delete(blockId)
-
-        // delete resources
-        await Block.delete_block(blockId)
-
-        // what do we do about the worker?
-        const worker = Block.blockWorkers.get(blockId)
-        if (worker) {
+        // Prevent double invalidation
+        if (Block.invalidatingBlocks.has(blockId)) {
             if (Block.debug) {
-                console.log('[Sharded] Closing worker:', blockId)
+                console.log('[Sharded] Block already being invalidated:', blockId)
             }
-            worker.close()
-            Block.blockWorkers.delete(blockId)
+            return
         }
-        return
+        
+        Block.invalidatingBlocks.add(blockId)
+        
+        try {
+            if (Block.debug) {
+                console.log('[Sharded] Starting invalidation of block:', blockId)
+            }
+            
+            // Wait for active operations to complete
+            const maxWaitTime = 30000 // 30 seconds max wait
+            const startTime = Date.now()
+            while (Block.activeOperations.has(blockId)) {
+                if (Date.now() - startTime > maxWaitTime) {
+                    console.warn(`[Sharded] Timeout waiting for operations to complete for block ${blockId}, forcing invalidation`)
+                    break
+                }
+                if (Block.debug) {
+                    console.log(`[Sharded] Waiting for ${Block.activeOperations.get(blockId)} active operations to complete for block ${blockId}`)
+                }
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+            
+            // Get references to resources before removing from maps
+            const blockClient = Block.blockClients.get(blockId)
+            const blockClientWithHooks = Block.blockClientsWithHooks.get(blockId)
+            const mainClient = Block.mainClients.get(blockId)
+            const queue = Block.blockQueues.get(blockId)
+            const worker = Block.blockWorkers.get(blockId)
+            
+            // Remove from maps atomically
+            Block.blockClients.delete(blockId)
+            Block.blockClientsWithHooks.delete(blockId)
+            Block.mainClients.delete(blockId)
+            Block.blockQueues.delete(blockId)
+            Block.blockWorkers.delete(blockId)
+            
+            // Close resources
+            if (worker) {
+                if (Block.debug) {
+                    console.log('[Sharded] Closing worker:', blockId)
+                }
+                await worker.close()
+            }
+            
+            // Close queue if it exists
+            if (queue) {
+                try {
+                    await queue.close()
+                } catch (err) {
+                    if (Block.debug) {
+                        console.error('[Sharded] Error closing queue:', err)
+                    }
+                }
+            }
+            
+            // Delete files last
+            await Block.delete_block(blockId)
+            
+            if (Block.debug) {
+                console.log('[Sharded] Successfully invalidated block:', blockId)
+            }
+            
+        } catch (error) {
+            console.error('[Sharded] Error during block invalidation:', error)
+            // Even if invalidation fails, we should remove from invalidating set
+        } finally {
+            Block.invalidatingBlocks.delete(blockId)
+        }
     }
 
     /**
@@ -814,10 +1033,20 @@ export class Block {
                 const lastSeenTime = parseInt(lastSeen[blockId])
                 const blockTtl = parseInt((await Block.redis?.hget("block_ttl", blockId)) ?? `${job.data.ttl}`) * 1000
                 if (Date.now() - lastSeenTime > blockTtl) {
-                    await Block.invalidate(blockId)
-                    Block.redis?.hdel("last_seen", blockId)
-                    Block.redis?.hdel("block_ttl", blockId)
-                    console.log('[Sharded] Invalidate block:', blockId)
+                    // Check if block has active operations before invalidating
+                    if (Block.canInvalidate(blockId)) {
+                        await Block.invalidate(blockId)
+                        Block.redis?.hdel("last_seen", blockId)
+                        Block.redis?.hdel("block_ttl", blockId)
+                        console.log('[Sharded] Invalidated block:', blockId)
+                    } else {
+                        // Extend grace period for active blocks
+                        const graceTime = Date.now() - (blockTtl * 0.8)
+                        Block.redis?.hset("last_seen", blockId, graceTime)
+                        if (Block.debug) {
+                            console.log(`[Sharded] Extended grace period for active block: ${blockId}`)
+                        }
+                    }
                 }
             }
         }, {
