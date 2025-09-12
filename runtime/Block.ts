@@ -327,13 +327,88 @@ export class Block {
     }
 
     /**
+     * Get all model names from a Prisma client instance
+     */
+    static getClientModels(client: any): string[] {
+        const models: string[] = []
+        
+        // Method 1: Try to get from Prisma's internal _dmmf (Data Model Meta Format)
+        try {
+            if (client._dmmf && client._dmmf.datamodel && client._dmmf.datamodel.models) {
+                const dmmfModels = client._dmmf.datamodel.models.map((model: any) => model.name.toLowerCase())
+                if (Block.debug) {
+                    console.log('[Sharded] Discovered models from DMMF:', dmmfModels)
+                }
+                return dmmfModels
+            }
+        } catch (err) {
+            if (Block.debug) {
+                console.log('[Sharded] Could not get models from _dmmf:', err)
+            }
+        }
+
+        // Method 2: Try to get from _runtimeDataModel (Prisma 5+)
+        try {
+            if (client._runtimeDataModel && client._runtimeDataModel.models) {
+                const runtimeModels = Object.keys(client._runtimeDataModel.models).map(name => name.toLowerCase())
+                if (Block.debug) {
+                    console.log('[Sharded] Discovered models from runtime data model:', runtimeModels)
+                }
+                return runtimeModels
+            }
+        } catch (err) {
+            if (Block.debug) {
+                console.log('[Sharded] Could not get models from _runtimeDataModel:', err)
+            }
+        }
+
+        // Method 3: Inspect client properties to find model delegates
+        try {
+            const clientKeys = Object.getOwnPropertyNames(client)
+            const modelPattern = /^[a-z][a-zA-Z0-9]*$/
+            
+            for (const key of clientKeys) {
+                // Skip internal properties, methods, and known non-model properties
+                if (key.startsWith('_') || key.startsWith('$') || typeof client[key] === 'function') {
+                    continue
+                }
+                
+                // Check if the property looks like a model delegate
+                if (modelPattern.test(key) && client[key] && typeof client[key] === 'object') {
+                    // Verify it has typical Prisma model methods
+                    const delegate = client[key]
+                    if (delegate && typeof delegate === 'object' && 
+                        delegate.findMany && delegate.create && delegate.update && delegate.delete) {
+                        models.push(key)
+                    }
+                }
+            }
+            
+            if (models.length > 0) {
+                if (Block.debug) {
+                    console.log('[Sharded] Discovered models from client inspection:', models)
+                }
+                return models
+            }
+        } catch (err) {
+            if (Block.debug) {
+                console.log('[Sharded] Could not inspect client properties:', err)
+            }
+        }
+
+        // Method 4: Fallback to common models if other methods fail
+        console.warn('[Sharded] Could not dynamically discover models, using fallback list')
+        return ['user', 'order'] // Fallback based on your schema - update this list as needed
+    }
+
+    /**
      * Reload block data from main database using the configured loader
      */
     static async reloadBlockData(blockId: string): Promise<void> {
         const blockClient = Block.blockClients.get(blockId)
         const mainClient = Block.mainClients.get(blockId)
         const loader = Block.blockLoaders.get(blockId)
-        
+
         if (!blockClient || !mainClient || !loader) {
             if (Block.debug) {
                 console.log(`[Sharded] Cannot reload block ${blockId}: missing clients or loader`)
@@ -341,16 +416,16 @@ export class Block {
             return
         }
 
-        if (Block.debug) {
-            console.log(`[Sharded] Reloading block data for ${blockId}`)
-        }
+        console.log(`[Sharded] Reloading block data for ${blockId}`)
+
 
         try {
             // Clear existing data before reloading
-            const models = ['User', 'Order'] // Add all your models here
+            // Dynamically get all models from the Prisma client
+            const models = Block.getClientModels(blockClient)
             for (const model of models) {
                 try {
-                    await (blockClient as any)[model.toLowerCase()].deleteMany({})
+                    await (blockClient as any)[model].deleteMany({})
                 } catch (err) {
                     // Model might not exist or be empty, continue
                     if (Block.debug) {
@@ -361,7 +436,7 @@ export class Block {
 
             // Use the original loader function to reload data
             await loader(blockClient, mainClient)
-            
+
             if (Block.debug) {
                 console.log(`[Sharded] Block data reloaded successfully for ${blockId}`)
             }
@@ -843,13 +918,13 @@ export class Block {
                                 })
                             }
                             let result = await query(args)
-                            
+
                             // If no result found in block, check main database
                             if (!result) {
                                 if (Block.debug) {
                                     console.log(`[Sharded] No result found in block for ${model}.findFirst, checking main database`)
                                 }
-                                
+
                                 const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
                                 if (mainResult) {
                                     if (Block.debug) {
@@ -861,7 +936,7 @@ export class Block {
                                     result = await query(args)
                                 }
                             }
-                            
+
                             return result
                         } finally {
                             Block.decrementOperationCount(blockId)
@@ -902,13 +977,13 @@ export class Block {
                                 })
                             }
                             let result = await query(args)
-                            
+
                             // If no result found in block, check main database
                             if (!result) {
                                 if (Block.debug) {
                                     console.log(`[Sharded] No result found in block for ${model}.findUnique, checking main database`)
                                 }
-                                
+
                                 const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
                                 if (mainResult) {
                                     if (Block.debug) {
@@ -920,7 +995,7 @@ export class Block {
                                     result = await query(args)
                                 }
                             }
-                            
+
                             return result
                         } finally {
                             Block.decrementOperationCount(blockId)
@@ -940,7 +1015,7 @@ export class Block {
                                     query,
                                 })
                             }
-                            
+
                             try {
                                 const result = await query(args)
                                 return result
@@ -950,7 +1025,7 @@ export class Block {
                                     if (Block.debug) {
                                         console.log(`[Sharded] Record not found in block for ${model}.findUniqueOrThrow, checking main database`)
                                     }
-                                    
+
                                     try {
                                         const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
                                         if (mainResult) {
@@ -989,7 +1064,7 @@ export class Block {
                                     query,
                                 })
                             }
-                            
+
                             try {
                                 const result = await query(args)
                                 return result
@@ -999,7 +1074,7 @@ export class Block {
                                     if (Block.debug) {
                                         console.log(`[Sharded] Record not found in block for ${model}.findFirstOrThrow, checking main database`)
                                     }
-                                    
+
                                     try {
                                         const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
                                         if (mainResult) {
@@ -1258,5 +1333,3 @@ export class Block {
         })
     }
 }
-
-
