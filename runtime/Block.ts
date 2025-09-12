@@ -80,6 +80,8 @@ export class Block {
     private static activeOperations = new Map<string, number>()
     // Track blocks currently being invalidated
     private static invalidatingBlocks = new Set<string>()
+    // Store loader functions for each block
+    private static blockLoaders = new Map<string, (blockClient: any, mainClient: any) => Promise<void>>()
 
     static async create<T>(config: BlockConfig<T>) {
         const node = config.node ?? 'worker'
@@ -202,6 +204,8 @@ export class Block {
                 config.blockId,
                 config.client as Prisma.DefaultPrismaClient,
             )
+            // Store the loader function for potential reloads
+            Block.blockLoaders.set(config.blockId, config.loader)
 
             // Add hooks to the block client
             const blockClientWithHooks = await Block.add_hooks(
@@ -320,6 +324,51 @@ export class Block {
             }
         }
         return null
+    }
+
+    /**
+     * Reload block data from main database using the configured loader
+     */
+    static async reloadBlockData(blockId: string): Promise<void> {
+        const blockClient = Block.blockClients.get(blockId)
+        const mainClient = Block.mainClients.get(blockId)
+        const loader = Block.blockLoaders.get(blockId)
+        
+        if (!blockClient || !mainClient || !loader) {
+            if (Block.debug) {
+                console.log(`[Sharded] Cannot reload block ${blockId}: missing clients or loader`)
+            }
+            return
+        }
+
+        if (Block.debug) {
+            console.log(`[Sharded] Reloading block data for ${blockId}`)
+        }
+
+        try {
+            // Clear existing data before reloading
+            const models = ['User', 'Order'] // Add all your models here
+            for (const model of models) {
+                try {
+                    await (blockClient as any)[model.toLowerCase()].deleteMany({})
+                } catch (err) {
+                    // Model might not exist or be empty, continue
+                    if (Block.debug) {
+                        console.log(`[Sharded] Could not clear model ${model} for block ${blockId}:`, err)
+                    }
+                }
+            }
+
+            // Use the original loader function to reload data
+            await loader(blockClient, mainClient)
+            
+            if (Block.debug) {
+                console.log(`[Sharded] Block data reloaded successfully for ${blockId}`)
+            }
+        } catch (err) {
+            console.error(`[Sharded] Error reloading block data for ${blockId}:`, err)
+            throw err
+        }
     }
 
     /**
@@ -793,7 +842,26 @@ export class Block {
                                     query,
                                 })
                             }
-                            const result = await query(args)
+                            let result = await query(args)
+                            
+                            // If no result found in block, check main database
+                            if (!result) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] No result found in block for ${model}.findFirst, checking main database`)
+                                }
+                                
+                                const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
+                                if (mainResult) {
+                                    if (Block.debug) {
+                                        console.log(`[Sharded] Found result in main database for ${model}.findFirst, reloading block`)
+                                    }
+                                    // Reload block data since we found the record in main DB
+                                    await Block.reloadBlockData(blockId)
+                                    // Try the query again after reload
+                                    result = await query(args)
+                                }
+                            }
+                            
                             return result
                         } finally {
                             Block.decrementOperationCount(blockId)
@@ -833,7 +901,26 @@ export class Block {
                                     query,
                                 })
                             }
-                            const result = await query(args)
+                            let result = await query(args)
+                            
+                            // If no result found in block, check main database
+                            if (!result) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] No result found in block for ${model}.findUnique, checking main database`)
+                                }
+                                
+                                const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
+                                if (mainResult) {
+                                    if (Block.debug) {
+                                        console.log(`[Sharded] Found result in main database for ${model}.findUnique, reloading block`)
+                                    }
+                                    // Reload block data since we found the record in main DB
+                                    await Block.reloadBlockData(blockId)
+                                    // Try the query again after reload
+                                    result = await query(args)
+                                }
+                            }
+                            
                             return result
                         } finally {
                             Block.decrementOperationCount(blockId)
@@ -853,8 +940,37 @@ export class Block {
                                     query,
                                 })
                             }
-                            const result = await query(args)
-                            return result
+                            
+                            try {
+                                const result = await query(args)
+                                return result
+                            } catch (error) {
+                                // If the error is "Record not found" type, check main database
+                                if ((error as any)?.code === 'P2025' || (error as any)?.message?.includes('No') || (error as any)?.message?.includes('not found')) {
+                                    if (Block.debug) {
+                                        console.log(`[Sharded] Record not found in block for ${model}.findUniqueOrThrow, checking main database`)
+                                    }
+                                    
+                                    try {
+                                        const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
+                                        if (mainResult) {
+                                            if (Block.debug) {
+                                                console.log(`[Sharded] Found result in main database for ${model}.findUniqueOrThrow, reloading block`)
+                                            }
+                                            // Reload block data since we found the record in main DB
+                                            await Block.reloadBlockData(blockId)
+                                            // Try the query again after reload
+                                            const result = await query(args)
+                                            return result
+                                        }
+                                    } catch (mainError) {
+                                        // If main DB also doesn't have it, throw the original error
+                                        throw error
+                                    }
+                                }
+                                // Re-throw other types of errors
+                                throw error
+                            }
                         } finally {
                             Block.decrementOperationCount(blockId)
                         }
@@ -873,8 +989,37 @@ export class Block {
                                     query,
                                 })
                             }
-                            const result = await query(args)
-                            return result
+                            
+                            try {
+                                const result = await query(args)
+                                return result
+                            } catch (error) {
+                                // If the error is "Record not found" type, check main database
+                                if ((error as any)?.code === 'P2025' || (error as any)?.message?.includes('No') || (error as any)?.message?.includes('not found')) {
+                                    if (Block.debug) {
+                                        console.log(`[Sharded] Record not found in block for ${model}.findFirstOrThrow, checking main database`)
+                                    }
+                                    
+                                    try {
+                                        const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
+                                        if (mainResult) {
+                                            if (Block.debug) {
+                                                console.log(`[Sharded] Found result in main database for ${model}.findFirstOrThrow, reloading block`)
+                                            }
+                                            // Reload block data since we found the record in main DB
+                                            await Block.reloadBlockData(blockId)
+                                            // Try the query again after reload
+                                            const result = await query(args)
+                                            return result
+                                        }
+                                    } catch (mainError) {
+                                        // If main DB also doesn't have it, throw the original error
+                                        throw error
+                                    }
+                                }
+                                // Re-throw other types of errors
+                                throw error
+                            }
                         } finally {
                             Block.decrementOperationCount(blockId)
                         }
@@ -996,6 +1141,7 @@ export class Block {
             Block.mainClients.delete(blockId)
             Block.blockQueues.delete(blockId)
             Block.blockWorkers.delete(blockId)
+            Block.blockLoaders.delete(blockId)
 
             // Close resources
             if (worker) {
