@@ -90,6 +90,7 @@ export class Block {
             await Block.locks.get(config.blockId)
         }
         Block.debug = config.debug ?? false
+        let lockResolve: (() => void) | undefined
         if (
             !Block.blockClientsWithHooks.has(config.blockId) ||
             !Block.blockClients.has(config.blockId) ||
@@ -99,21 +100,7 @@ export class Block {
                 console.log('[Sharded] Locking creation of block:', config.blockId)
             }
             Block.locks.set(config.blockId, new Promise(resolve => {
-                const interval = setInterval(() => {
-                    if (Block.debug) {
-                        console.log('[Sharded] Checking lock', config.blockId)
-                    }
-                    if (Block.blockClientsWithHooks.has(config.blockId) &&
-                        Block.blockClients.has(config.blockId) &&
-                        Block.mainClients.has(config.blockId)) {
-                        Block.locks.delete(config.blockId)
-                        if (Block.debug) {
-                            console.log('[Sharded] Unlocking creation of block:', config.blockId)
-                        }
-                        resolve()
-                        clearInterval(interval)
-                    }
-                }, 500)
+                lockResolve = resolve
             }))
 
             if (Block.debug) {
@@ -227,11 +214,26 @@ export class Block {
             )
 
             if (reload) {
+                if (Block.debug) {
+                    console.log('[Sharded] Loading block data:', config.blockId)
+                }
                 await config.loader(blockClient as T, config.client as T)
+                if (Block.debug) {
+                    console.log('[Sharded] Block data loaded:', config.blockId)
+                }
             }
 
             if (Block.debug) {
                 console.log('[Sharded] Created block:', config.blockId)
+            }
+
+            // Resolve the lock after everything is complete (including loader)
+            Block.locks.delete(config.blockId)
+            if (lockResolve) {
+                if (Block.debug) {
+                    console.log('[Sharded] Unlocking creation of block:', config.blockId)
+                }
+                lockResolve()
             }
         }
 
