@@ -164,12 +164,15 @@ export class Block {
                 ...config.prismaOptions,
             })
 
-            // Enable WAL mode and set pragmas for better performance
+            // Enable WAL mode and set pragmas optimized for multi-process performance
             try {
                 await blockClient.$queryRaw`PRAGMA journal_mode=WAL`
                 await blockClient.$queryRaw`PRAGMA synchronous=NORMAL`
                 await blockClient.$queryRaw`PRAGMA busy_timeout=5000`
                 await blockClient.$queryRaw`PRAGMA cache_size=-2000` // Use 2MB of memory for cache
+                await blockClient.$queryRaw`PRAGMA wal_autocheckpoint=1000` // Checkpoint every 1000 pages
+                await blockClient.$queryRaw`PRAGMA mmap_size=268435456` // 256MB memory mapping for better I/O
+                await blockClient.$queryRaw`PRAGMA temp_store=MEMORY` // Keep temp tables in memory
             } catch (err) {
                 if (Block.debug) {
                     console.error(
@@ -249,14 +252,52 @@ export class Block {
 
         // Tracking block for invalidation
         Block.redis.hset("last_seen", config.blockId, Date.now())
-        
+
         // Safe retrieval with race condition handling
         const block = await Block.safeGetBlock<T>(config.blockId)
         if (!block) {
             throw new Error(`Failed to create or retrieve block: ${config.blockId}. It may have been invalidated during creation.`)
         }
-        
+
         return block
+    }
+
+    /**
+     * Wait for all pending sync operations to complete for a given block
+     */
+    static async waitForPendingSyncs(blockId: string, timeoutMs: number = 30000): Promise<void> {
+        const queue = Block.blockQueues.get(blockId)
+        if (!queue) {
+            if (Block.debug) {
+                console.log(`[Sharded] No queue found for block ${blockId}, assuming no pending syncs`)
+            }
+            return
+        }
+
+        const startTime = Date.now()
+
+        while (Date.now() - startTime < timeoutMs) {
+            const waiting = await queue.getWaiting()
+            const active = await queue.getActive()
+            const delayed = await queue.getDelayed()
+
+            const totalPending = waiting.length + active.length + delayed.length
+
+            if (totalPending === 0) {
+                if (Block.debug) {
+                    console.log(`[Sharded] All syncs completed for block ${blockId}`)
+                }
+                return
+            }
+
+            if (Block.debug) {
+                console.log(`[Sharded] Waiting for ${totalPending} pending syncs for block ${blockId}`)
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 100))
+        }
+
+        console.warn(`[Sharded] Timeout waiting for pending syncs for block ${blockId}`)
     }
 
     /**
@@ -270,7 +311,7 @@ export class Block {
                 Block.redis?.hset("last_seen", blockId, Date.now())
                 return block as T
             }
-            
+
             if (attempt < maxRetries - 1) {
                 // Wait a bit before retrying
                 await new Promise(resolve => setTimeout(resolve, 100))
@@ -467,9 +508,7 @@ export class Block {
                         },
                     )
                     // Re-throw the error to make it visible
-                    throw new Error(
-                        `Duplicate record detected in ${model}. This might indicate a bug in your application logic.`,
-                    )
+                    throw err
                 }
                 throw err
             }
@@ -541,7 +580,7 @@ export class Block {
                     async create({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 create', {
@@ -553,7 +592,7 @@ export class Block {
                             }
                             // Execute in block DB first to get the ID
                             const result = await query(args)
-                            
+
                             // Queue the operation with the result's ID
                             await Block.queue_operation(blockId, {
                                 operation,
@@ -575,7 +614,7 @@ export class Block {
                     async createMany({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 createMany', {
@@ -613,7 +652,7 @@ export class Block {
                     async update({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 update', {
@@ -638,7 +677,7 @@ export class Block {
                     async updateMany({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 updateMany', {
@@ -663,7 +702,7 @@ export class Block {
                     async upsert({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 upsert', {
@@ -688,7 +727,7 @@ export class Block {
                     async delete({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 delete', {
@@ -715,7 +754,7 @@ export class Block {
                     async deleteMany({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 deleteMany', {
@@ -742,7 +781,7 @@ export class Block {
                     async findFirst({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 findFirst', {
@@ -762,7 +801,7 @@ export class Block {
                     async findMany({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 findMany', {
@@ -782,7 +821,7 @@ export class Block {
                     async findUnique({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 findUnique', {
@@ -802,7 +841,7 @@ export class Block {
                     async findUniqueOrThrow({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 findUniqueOrThrow', {
@@ -822,7 +861,7 @@ export class Block {
                     async findFirstOrThrow({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 findFirstOrThrow', {
@@ -843,7 +882,7 @@ export class Block {
                     async count({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 count', {
@@ -863,7 +902,7 @@ export class Block {
                     async aggregate({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 aggregate', {
@@ -883,7 +922,7 @@ export class Block {
                     async groupBy({ operation, args, model, query }) {
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
-                        
+
                         try {
                             if (Block.debug) {
                                 console.log('🔄 groupBy', {
@@ -914,14 +953,14 @@ export class Block {
             }
             return
         }
-        
+
         Block.invalidatingBlocks.add(blockId)
-        
+
         try {
             if (Block.debug) {
                 console.log('[Sharded] Starting invalidation of block:', blockId)
             }
-            
+
             // Wait for active operations to complete
             const maxWaitTime = 30000 // 30 seconds max wait
             const startTime = Date.now()
@@ -935,21 +974,27 @@ export class Block {
                 }
                 await new Promise(resolve => setTimeout(resolve, 100))
             }
-            
+
+            // Wait for pending sync operations to complete
+            if (Block.debug) {
+                console.log(`[Sharded] Waiting for pending syncs before invalidating block ${blockId}`)
+            }
+            await Block.waitForPendingSyncs(blockId, maxWaitTime)
+
             // Get references to resources before removing from maps
             const blockClient = Block.blockClients.get(blockId)
             const blockClientWithHooks = Block.blockClientsWithHooks.get(blockId)
             const mainClient = Block.mainClients.get(blockId)
             const queue = Block.blockQueues.get(blockId)
             const worker = Block.blockWorkers.get(blockId)
-            
+
             // Remove from maps atomically
             Block.blockClients.delete(blockId)
             Block.blockClientsWithHooks.delete(blockId)
             Block.mainClients.delete(blockId)
             Block.blockQueues.delete(blockId)
             Block.blockWorkers.delete(blockId)
-            
+
             // Close resources
             if (worker) {
                 if (Block.debug) {
@@ -957,7 +1002,7 @@ export class Block {
                 }
                 await worker.close()
             }
-            
+
             // Close queue if it exists
             if (queue) {
                 try {
@@ -968,14 +1013,14 @@ export class Block {
                     }
                 }
             }
-            
+
             // Delete files last
             await Block.delete_block(blockId)
-            
+
             if (Block.debug) {
                 console.log('[Sharded] Successfully invalidated block:', blockId)
             }
-            
+
         } catch (error) {
             console.error('[Sharded] Error during block invalidation:', error)
             // Even if invalidation fails, we should remove from invalidating set
