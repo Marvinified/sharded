@@ -82,28 +82,102 @@ export class Block {
     private static invalidatingBlocks = new Set<string>()
     // Store loader functions for each block
     private static blockLoaders = new Map<string, (blockClient: any, mainClient: any) => Promise<void>>()
+    
+    static setDebug(debug: boolean) {
+        Block.debug = debug
+    }
 
     static async create<T>(config: BlockConfig<T>) {
         const node = config.node ?? 'worker'
+        // Initialize Redis if not already done
+        if (!Block.redis) {
+            Block.redis = new Redis(config.connection ?? {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT
+                    ? parseInt(process.env.REDIS_PORT)
+                    : 6379,
+                password: process.env.REDIS_PASSWORD,
+            })
+        }
+
+        // Check for in-process locks (creation/reload)
         if (Block.locks.has(config.blockId)) {
             if (Block.debug) {
-                console.log('[Sharded] Has lock', config.blockId)
+                console.log('[Sharded] Block being created/reloaded, waiting...', config.blockId)
             }
             await Block.locks.get(config.blockId)
         }
         Block.debug = config.debug ?? false
-        let lockResolve: (() => void) | undefined
-        if (
-            !Block.blockClientsWithHooks.has(config.blockId) ||
+        
+        // Check if block already exists in this process - if so, return immediately
+        const needsCreation = !Block.blockClientsWithHooks.has(config.blockId) ||
             !Block.blockClients.has(config.blockId) ||
             !Block.mainClients.has(config.blockId)
-        ) {
+
+        // Fast path: if block already exists, return it without any locking
+        if (!needsCreation) {
             if (Block.debug) {
-                console.log('[Sharded] Locking creation of block:', config.blockId)
+                console.log(`[Sharded] Block ${config.blockId} already exists in process, returning existing block`)
             }
-            Block.locks.set(config.blockId, new Promise(resolve => {
-                lockResolve = resolve
-            }))
+            
+            // Update tracking for existing block
+            Block.redis.hset("last_seen", config.blockId, Date.now())
+            if (config.node === 'master' && config.ttl) {
+                Block.redis.hset("block_ttl", config.blockId, config.ttl)
+            }
+            
+            // Return existing block
+            const block = await Block.safeGetBlock<T>(config.blockId)
+            if (!block) {
+                throw new Error(`Failed to retrieve existing block: ${config.blockId}`)
+            }
+            return block
+        }
+
+        let lockResolve: (() => void) | undefined
+        let redisLockAcquired = false
+
+        // Only acquire Redis lock if we actually need to create the block AND we're a master
+        if (needsCreation && node === 'master') {
+            // Use shared lock for both master creation and reload operations
+            const blockLockKey = `block_lock:${config.blockId}`
+            const processId = `${process.pid}_${Date.now()}`
+
+            // Try to acquire block lock with 30 second timeout
+            const maxWaitTime = 30000
+            const startTime = Date.now()
+
+            while (!redisLockAcquired && (Date.now() - startTime < maxWaitTime)) {
+                const result = await Block.redis.set(blockLockKey, processId, 'PX', 30000, 'NX')
+                if (result === 'OK') {
+                    redisLockAcquired = true
+                    if (Block.debug) {
+                        console.log(`[Sharded] Acquired block lock for master creation: ${config.blockId}`)
+                    }
+                } else {
+                    if (Block.debug) {
+                        console.log(`[Sharded] Block lock exists for ${config.blockId}, waiting...`)
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                }
+            }
+
+            if (!redisLockAcquired) {
+                throw new Error(`Failed to acquire block lock for block ${config.blockId} within timeout`)
+            }
+        }
+
+        if (needsCreation) {
+            // Only lock during master creation to prevent multiple masters
+            // Workers can be created simultaneously as they just connect to existing SQLite
+            if (node === 'master') {
+                if (Block.debug) {
+                    console.log('[Sharded] Locking master creation of block:', config.blockId)
+                }
+                Block.locks.set(config.blockId, new Promise(resolve => {
+                    lockResolve = resolve
+                }))
+            }
 
             if (Block.debug) {
                 console.log('[Sharded] Creating new block:', config.blockId)
@@ -231,24 +305,23 @@ export class Block {
                 console.log('[Sharded] Created block:', config.blockId)
             }
 
-            // Resolve the lock after everything is complete (including loader)
-            Block.locks.delete(config.blockId)
+            // Resolve the in-process lock after everything is complete (including loader)
             if (lockResolve) {
+                Block.locks.delete(config.blockId)
                 if (Block.debug) {
                     console.log('[Sharded] Unlocking creation of block:', config.blockId)
                 }
                 lockResolve()
             }
-        }
 
-        if (!Block.redis) {
-            Block.redis = new Redis(config.connection ?? {
-                host: process.env.REDIS_HOST ?? 'localhost',
-                port: process.env.REDIS_PORT
-                    ? parseInt(process.env.REDIS_PORT)
-                    : 6379,
-                password: process.env.REDIS_PASSWORD,
-            })
+            // Release Redis block lock if we acquired it
+            if (redisLockAcquired) {
+                const blockLockKey = `block_lock:${config.blockId}`
+                await Block.redis?.del(blockLockKey)
+                if (Block.debug) {
+                    console.log(`[Sharded] Released block lock for ${config.blockId}`)
+                }
+            }
         }
 
 
@@ -331,7 +404,7 @@ export class Block {
      */
     static getClientModels(client: any): string[] {
         const models: string[] = []
-        
+
         // Method 1: Try to get from Prisma's internal _dmmf (Data Model Meta Format)
         try {
             if (client._dmmf && client._dmmf.datamodel && client._dmmf.datamodel.models) {
@@ -366,24 +439,24 @@ export class Block {
         try {
             const clientKeys = Object.getOwnPropertyNames(client)
             const modelPattern = /^[a-z][a-zA-Z0-9]*$/
-            
+
             for (const key of clientKeys) {
                 // Skip internal properties, methods, and known non-model properties
                 if (key.startsWith('_') || key.startsWith('$') || typeof client[key] === 'function') {
                     continue
                 }
-                
+
                 // Check if the property looks like a model delegate
                 if (modelPattern.test(key) && client[key] && typeof client[key] === 'object') {
                     // Verify it has typical Prisma model methods
                     const delegate = client[key]
-                    if (delegate && typeof delegate === 'object' && 
+                    if (delegate && typeof delegate === 'object' &&
                         delegate.findMany && delegate.create && delegate.update && delegate.delete) {
                         models.push(key)
                     }
                 }
             }
-            
+
             if (models.length > 0) {
                 if (Block.debug) {
                     console.log('[Sharded] Discovered models from client inspection:', models)
@@ -405,6 +478,42 @@ export class Block {
      * Reload block data from main database using the configured loader
      */
     static async reloadBlockData(blockId: string): Promise<void> {
+        // Use the same shared lock as master creation - they are mutually exclusive
+        const blockLockKey = `block_lock:${blockId}`
+        const processId = `${process.pid}_${Date.now()}`
+
+        // Try to acquire block lock with 30 second timeout
+        let lockAcquired = false
+        const maxWaitTime = 30000
+        const startTime = Date.now()
+
+        while (!lockAcquired && (Date.now() - startTime < maxWaitTime)) {
+            const result = await Block.redis?.set(blockLockKey, processId, 'PX', 30000, 'NX')
+            if (result === 'OK') {
+                lockAcquired = true
+                if (Block.debug) {
+                    console.log(`[Sharded] Acquired block lock for reload: ${blockId}`)
+                }
+            } else {
+                if (Block.debug) {
+                    console.log(`[Sharded] Block lock exists for ${blockId}, waiting...`)
+                }
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+        }
+
+        if (!lockAcquired) {
+            throw new Error(`Failed to acquire block lock for block ${blockId} within timeout`)
+        }
+
+        // Check for in-process locks (creation/reload)
+        if (Block.locks.has(blockId)) {
+            if (Block.debug) {
+                console.log(`[Sharded] Waiting for existing in-process lock during reload: ${blockId}`)
+            }
+            await Block.locks.get(blockId)
+        }
+
         const blockClient = Block.blockClients.get(blockId)
         const mainClient = Block.mainClients.get(blockId)
         const loader = Block.blockLoaders.get(blockId)
@@ -418,8 +527,27 @@ export class Block {
 
         console.log(`[Sharded] Reloading block data for ${blockId}`)
 
+        // Create a lock to prevent concurrent reloads and block creation
+        let lockResolve: (() => void) | undefined
+        Block.locks.set(blockId, new Promise(resolve => {
+            lockResolve = resolve
+        }))
 
         try {
+            // Wait for any active operations to complete before reloading
+            const maxWaitTime = 30000 // 30 seconds max wait
+            const startTime = Date.now()
+            while (Block.activeOperations.has(blockId)) {
+                if (Date.now() - startTime > maxWaitTime) {
+                    console.warn(`[Sharded] Timeout waiting for operations to complete during reload of block ${blockId}, proceeding anyway`)
+                    break
+                }
+                if (Block.debug) {
+                    console.log(`[Sharded] Waiting for ${Block.activeOperations.get(blockId)} active operations to complete before reloading block ${blockId}`)
+                }
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+
             // Clear existing data before reloading
             // Dynamically get all models from the Prisma client
             const models = Block.getClientModels(blockClient)
@@ -443,7 +571,51 @@ export class Block {
         } catch (err) {
             console.error(`[Sharded] Error reloading block data for ${blockId}:`, err)
             throw err
+        } finally {
+            // Always release the in-process lock
+            Block.locks.delete(blockId)
+            if (lockResolve) {
+                lockResolve()
+            }
+
+            // Release Redis block lock
+            const blockLockKey = `block_lock:${blockId}`
+            await Block.redis?.del(blockLockKey)
+            if (Block.debug) {
+                console.log(`[Sharded] Released block lock for ${blockId}`)
+            }
         }
+    }
+
+    /**
+     * Check if block is locked for creation or reload (cross-process)
+     */
+    static async waitForBlockReady(blockId: string): Promise<void> {
+        // Check for Redis block lock (master creation or reload)
+        const blockLockKey = `block_lock:${blockId}`
+
+        const maxWaitTime = 30000
+        const startTime = Date.now()
+
+        while (Date.now() - startTime < maxWaitTime) {
+            const blockLockExists = await Block.redis?.exists(blockLockKey)
+
+            if (!blockLockExists) {
+                // Also check in-process locks
+                if (!Block.locks.has(blockId)) {
+                    return // Block is ready for operations
+                }
+            }
+
+            if (Block.debug) {
+                const lockType = blockLockExists ? 'block operation (master creation/reload)' : 'in-process'
+                console.log(`[Sharded] Waiting for ${lockType} to complete for block ${blockId}`)
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 100))
+        }
+
+        throw new Error(`Timeout waiting for block ${blockId} to be ready for operations`)
     }
 
     /**
@@ -473,10 +645,33 @@ export class Block {
     }
 
     /**
-     * Check if a block can be safely invalidated (no active operations)
+     * Check if a block can be safely invalidated (no active operations, creation, or reload)
      */
-    static canInvalidate(blockId: string): boolean {
-        return !Block.activeOperations.has(blockId) && !Block.invalidatingBlocks.has(blockId)
+    static async canInvalidate(blockId: string): Promise<boolean> {
+        // Check for active operations and double invalidation
+        if (Block.activeOperations.has(blockId) || Block.invalidatingBlocks.has(blockId)) {
+            return false
+        }
+
+        // Check for Redis lock (master creation or reload in progress)
+        const blockLockKey = `block_lock:${blockId}`
+        const lockExists = await Block.redis?.exists(blockLockKey)
+        if (lockExists) {
+            if (Block.debug) {
+                console.log(`[Sharded] Cannot invalidate ${blockId}: block creation/reload in progress`)
+            }
+            return false
+        }
+
+        // Check for in-process locks
+        if (Block.locks.has(blockId)) {
+            if (Block.debug) {
+                console.log(`[Sharded] Cannot invalidate ${blockId}: in-process lock exists`)
+            }
+            return false
+        }
+
+        return true
     }
 
     static async delete_block(blockId: string) {
@@ -704,6 +899,9 @@ export class Block {
             query: {
                 $allModels: {
                     async create({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -738,6 +936,9 @@ export class Block {
                     },
 
                     async createMany({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -776,6 +977,9 @@ export class Block {
                     },
 
                     async update({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -801,6 +1005,9 @@ export class Block {
                     },
 
                     async updateMany({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -826,6 +1033,9 @@ export class Block {
                     },
 
                     async upsert({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -851,6 +1061,9 @@ export class Block {
                     },
 
                     async delete({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -878,6 +1091,9 @@ export class Block {
                     },
 
                     async deleteMany({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -905,6 +1121,9 @@ export class Block {
                     },
 
                     async findFirst({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -944,6 +1163,9 @@ export class Block {
                     },
 
                     async findMany({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -964,6 +1186,9 @@ export class Block {
                     },
 
                     async findUnique({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -1003,6 +1228,9 @@ export class Block {
                     },
 
                     async findUniqueOrThrow({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -1052,6 +1280,9 @@ export class Block {
                     },
 
                     async findFirstOrThrow({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -1102,6 +1333,9 @@ export class Block {
 
                     // these need to be pulled directly from the main client, Ideally you don't want to do this
                     async count({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -1122,6 +1356,9 @@ export class Block {
                     },
 
                     async aggregate({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -1142,6 +1379,9 @@ export class Block {
                     },
 
                     async groupBy({ operation, args, model, query }) {
+                        // Wait for any locks (master creation/reload) to complete before executing
+                        await Block.waitForBlockReady(blockId)
+
                         Block.incrementOperationCount(blockId)
                         Block.redis?.hset("last_seen", blockId, Date.now())
 
@@ -1168,11 +1408,44 @@ export class Block {
     }
 
     static async invalidate(blockId: string) {
-        // Prevent double invalidation
+        // Use the same block_lock as master creation/reload for mutual exclusion
+        const blockLockKey = `block_lock:${blockId}`
+        const processId = `${process.pid}_${Date.now()}`
+        
+        // Try to acquire block lock with 30 second timeout
+        let lockAcquired = false
+        const maxWaitTime = 30000
+        const startTime = Date.now()
+        
+        while (!lockAcquired && (Date.now() - startTime < maxWaitTime)) {
+            const result = await Block.redis?.set(blockLockKey, processId, 'PX', 30000, 'NX')
+            if (result === 'OK') {
+                lockAcquired = true
+                if (Block.debug) {
+                    console.log(`[Sharded] Acquired block lock for invalidation: ${blockId}`)
+                }
+            } else {
+                if (Block.debug) {
+                    console.log(`[Sharded] Block lock exists for ${blockId}, waiting...`)
+                }
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+        }
+        
+        if (!lockAcquired) {
+            if (Block.debug) {
+                console.log(`[Sharded] Failed to acquire block lock for invalidation of ${blockId}`)
+            }
+            return // Another process is using the block
+        }
+
+        // Prevent double invalidation locally as well
         if (Block.invalidatingBlocks.has(blockId)) {
             if (Block.debug) {
-                console.log('[Sharded] Block already being invalidated:', blockId)
+                console.log('[Sharded] Block already being invalidated locally:', blockId)
             }
+            // Release the Redis lock since we won't proceed
+            await Block.redis?.del(blockLockKey)
             return
         }
 
@@ -1249,6 +1522,13 @@ export class Block {
             // Even if invalidation fails, we should remove from invalidating set
         } finally {
             Block.invalidatingBlocks.delete(blockId)
+            
+            // Always release the Redis block lock
+            const blockLockKey = `block_lock:${blockId}`
+            await Block.redis?.del(blockLockKey)
+            if (Block.debug) {
+                console.log(`[Sharded] Released block lock after invalidation: ${blockId}`)
+            }
         }
     }
 
@@ -1301,8 +1581,8 @@ export class Block {
                 const lastSeenTime = parseInt(lastSeen[blockId])
                 const blockTtl = parseInt((await Block.redis?.hget("block_ttl", blockId)) ?? `${job.data.ttl}`) * 1000
                 if (Date.now() - lastSeenTime > blockTtl) {
-                    // Check if block has active operations before invalidating
-                    if (Block.canInvalidate(blockId)) {
+                    // Check if block has active operations, creation, or reload before invalidating
+                    if (await Block.canInvalidate(blockId)) {
                         await Block.invalidate(blockId)
                         Block.redis?.hdel("last_seen", blockId)
                         Block.redis?.hdel("block_ttl", blockId)
@@ -1312,7 +1592,7 @@ export class Block {
                         const graceTime = Date.now() - (blockTtl * 0.8)
                         Block.redis?.hset("last_seen", blockId, graceTime)
                         if (Block.debug) {
-                            console.log(`[Sharded] Extended grace period for active block: ${blockId}`)
+                            console.log(`[Sharded] Extended grace period for active/locked block: ${blockId}`)
                         }
                     }
                 }
