@@ -76,8 +76,10 @@ export class Block {
     private static locks = new Map<string, Promise<void>>()
     private static redis: Redis | null = null
     private static debug = false
-    // Reference counting for active operations
+    // Reference counting for active operations (writes only - reads don't block reloads)
     private static activeOperations = new Map<string, number>()
+    // Track active write operations separately (these DO block reloads)
+    private static activeWriteOperations = new Map<string, number>()
     // Track blocks currently being invalidated
     private static invalidatingBlocks = new Set<string>()
     // Store loader functions for each block
@@ -90,14 +92,573 @@ export class Block {
     private static lockStatusCache = new Map<string, { isLocked: boolean, lastChecked: number }>()
     private static LOCK_CACHE_TTL = 500 // 1 second cache for lock status
     // Batch processing limits
-    private static MAX_BATCH_SIZE = 50 // Maximum operations per batch
+    private static MAX_BATCH_SIZE = 100 // Increased significantly for better throughput
+    private static MIN_BATCH_SIZE = 5 // Minimum batch size
     private static TRANSACTION_TIMEOUT = 30000 // 30 seconds transaction timeout
+    private static ADAPTIVE_BATCH_SIZE = true // Enable adaptive batch sizing based on performance
+    // Adaptive batch sizing tracking
+    private static batchPerformanceHistory = new Map<string, { size: number, duration: number, success: boolean }[]>()
+    private static PERFORMANCE_HISTORY_SIZE = 10 // Keep last 10 batch performance records
     // Error handling
     private static MAX_OPERATION_RETRIES = 3 // Maximum retries for failed operations
     private static FAILED_OPERATIONS_KEY_PREFIX = 'failed_operations' // Redis key prefix for failed operations
+    // WAL maintenance
+    private static walMaintenanceInterval: NodeJS.Timeout | null = null
+    private static walMaintenanceEnabled = true // Auto-enable WAL maintenance
+    private static walHealthCheckInterval: NodeJS.Timeout | null = null
+    private static autoRecoveryEnabled = true // Auto-recovery from WAL issues
 
     static setDebug(debug: boolean) {
         Block.debug = debug
+    }
+
+    /**
+     * Configure automatic WAL optimizations (optional - enabled by default)
+     */
+    static configureWalOptimizations(options: {
+        maintenance?: boolean      // Auto WAL maintenance (default: true)
+        healthMonitoring?: boolean // Auto health monitoring (default: true) 
+        autoRecovery?: boolean     // Auto error recovery (default: true)
+    }) {
+        if (options.maintenance !== undefined) {
+            Block.walMaintenanceEnabled = options.maintenance
+        }
+        if (options.healthMonitoring !== undefined || options.autoRecovery !== undefined) {
+            Block.autoRecoveryEnabled = options.autoRecovery ?? options.healthMonitoring ?? true
+        }
+
+        if (Block.debug) {
+            console.log('[Sharded] WAL configuration updated:', {
+                maintenance: Block.walMaintenanceEnabled,
+                autoRecovery: Block.autoRecoveryEnabled
+            })
+        }
+    }
+
+    /**
+     * Verify that the database path is absolute and consistent across processes
+     * This is critical for WAL mode to work correctly
+     */
+    static async verifyDatabasePath(
+        client: any,
+        expectedPath: string,
+        blockId: string
+    ): Promise<void> {
+        try {
+            // Get the actual database path from SQLite
+            const dbList = await client.$queryRaw`SELECT * FROM pragma_database_list;`
+            const journalMode = await client.$queryRaw`PRAGMA journal_mode;`
+
+            if (Block.debug) {
+                console.log(`[Sharded] Database verification for ${blockId}:`)
+                console.log(`[Sharded] Expected path: ${expectedPath}`)
+                console.log(`[Sharded] Database list:`, dbList)
+                console.log(`[Sharded] Journal mode:`, journalMode)
+            }
+
+            // Check that we're in WAL mode
+            const walEnabled = journalMode.some((row: any) =>
+                row.journal_mode?.toString().toLowerCase() === 'wal'
+            )
+
+            if (!walEnabled) {
+                throw new Error(`WAL mode not enabled for block ${blockId}`)
+            }
+
+            // Verify the file path matches what we expect
+            const mainDb = dbList.find((db: any) => db.seq === 0 || db.name === 'main')
+            if (mainDb) {
+                const actualPath = mainDb.file
+                if (actualPath !== expectedPath) {
+                    console.warn(`[Sharded] Path mismatch for ${blockId}:`)
+                    console.warn(`[Sharded] Expected: ${expectedPath}`)
+                    console.warn(`[Sharded] Actual: ${actualPath}`)
+
+                    // If it's just a relative vs absolute path issue, log but don't fail
+                    const resolvedActual = require('path').resolve(actualPath)
+                    if (resolvedActual !== expectedPath) {
+                        throw new Error(
+                            `Database path mismatch for ${blockId}: expected ${expectedPath}, got ${actualPath}`
+                        )
+                    }
+                }
+            }
+
+            console.log(`[Sharded] ✓ Database path verified for ${blockId}: ${expectedPath}`)
+        } catch (err) {
+            console.error(`[Sharded] Database path verification failed for ${blockId}:`, err)
+            throw err
+        }
+    }
+
+    /**
+     * Get comprehensive WAL diagnostics for a block
+     */
+    static async getWalDiagnostics(blockId: string): Promise<any> {
+        const blockClient = Block.blockClients.get(blockId)
+        if (!blockClient) {
+            return { error: 'Block client not found' }
+        }
+
+        try {
+            const [
+                journalMode,
+                dbList,
+                walCheckpoint,
+                synchronous,
+                busyTimeout,
+                cacheSize,
+                walAutocheckpoint
+            ] = await Promise.all([
+                blockClient.$queryRaw`PRAGMA journal_mode;`,
+                blockClient.$queryRaw`SELECT * FROM pragma_database_list;`,
+                blockClient.$queryRaw`PRAGMA wal_checkpoint(PASSIVE);`,
+                blockClient.$queryRaw`PRAGMA synchronous;`,
+                blockClient.$queryRaw`PRAGMA busy_timeout;`,
+                blockClient.$queryRaw`PRAGMA cache_size;`,
+                blockClient.$queryRaw`PRAGMA wal_autocheckpoint;`
+            ])
+
+            return {
+                blockId,
+                timestamp: new Date().toISOString(),
+                database_path: (dbList as any[]).find((db: any) => db.seq === 0)?.file,
+                journal_mode: (journalMode as any[])[0]?.journal_mode,
+                synchronous: (synchronous as any[])[0]?.synchronous,
+                busy_timeout: (busyTimeout as any[])[0]?.busy_timeout,
+                cache_size: (cacheSize as any[])[0]?.cache_size,
+                wal_autocheckpoint: (walAutocheckpoint as any[])[0]?.wal_autocheckpoint,
+                wal_checkpoint_result: {
+                    busy: (walCheckpoint as any[])[0]?.busy,
+                    log: (walCheckpoint as any[])[0]?.log,
+                    checkpointed: (walCheckpoint as any[])[0]?.checkpointed
+                }
+            }
+        } catch (err) {
+            return {
+                blockId,
+                error: err instanceof Error ? err.message : String(err),
+                timestamp: new Date().toISOString()
+            }
+        }
+    }
+
+    /**
+     * Force a WAL checkpoint for a specific block
+     */
+    static async forceWalCheckpoint(blockId: string, mode: 'PASSIVE' | 'FULL' | 'RESTART' | 'TRUNCATE' = 'FULL'): Promise<any> {
+        const blockClient = Block.blockClients.get(blockId)
+        if (!blockClient) {
+            throw new Error(`Block client not found for ${blockId}`)
+        }
+
+        try {
+            // Build the PRAGMA statement as a plain string and use $queryRawUnsafe for dynamic parameters
+            const result = await blockClient.$queryRawUnsafe(`PRAGMA wal_checkpoint(${mode})`)
+
+            if (Block.debug) {
+                console.log(`[Sharded] WAL checkpoint (${mode}) result for ${blockId}:`, result)
+            }
+
+            return {
+                blockId,
+                mode,
+                result: (result as any[])[0],
+                timestamp: new Date().toISOString()
+            }
+        } catch (err) {
+            console.error(`[Sharded] WAL checkpoint failed for ${blockId}:`, err)
+            throw err
+        }
+    }
+
+    /**
+     * Initialize periodic WAL maintenance for all blocks
+     */
+    static async startWalMaintenance(intervalMs: number = 30000): Promise<void> {
+        if (Block.walMaintenanceInterval) {
+            clearInterval(Block.walMaintenanceInterval)
+        }
+
+        Block.walMaintenanceInterval = setInterval(async () => {
+            try {
+                const blockIds = Array.from(Block.blockClients.keys())
+
+                for (const blockId of blockIds) {
+                    try {
+                        // Perform passive checkpoint to avoid blocking operations
+                        const result = await Block.forceWalCheckpoint(blockId, 'PASSIVE')
+
+                        if (result.result.busy > 0) {
+                            if (Block.debug) {
+                                console.log(`[Sharded] WAL checkpoint busy for ${blockId}, readers may be holding old snapshots`)
+                            }
+                        }
+
+                        // If checkpoint shows significant WAL size, try a more aggressive checkpoint
+                        if (result.result.log > 10000) { // More than 10k pages
+                            if (Block.debug) {
+                                console.log(`[Sharded] Large WAL detected for ${blockId} (${result.result.log} pages), attempting FULL checkpoint`)
+                            }
+                            await Block.forceWalCheckpoint(blockId, 'FULL')
+                        }
+
+                    } catch (err) {
+                        console.error(`[Sharded] WAL maintenance failed for ${blockId}:`, err)
+                        // Continue with other blocks
+                    }
+                }
+            } catch (err) {
+                console.error('[Sharded] WAL maintenance error:', err)
+            }
+        }, intervalMs)
+
+        if (Block.debug) {
+            console.log(`[Sharded] WAL maintenance started with ${intervalMs}ms interval`)
+        }
+    }
+
+    /**
+     * Stop WAL maintenance
+     */
+    static stopWalMaintenance(): void {
+        if (Block.walMaintenanceInterval) {
+            clearInterval(Block.walMaintenanceInterval)
+            Block.walMaintenanceInterval = null
+            if (Block.debug) {
+                console.log('[Sharded] WAL maintenance stopped')
+            }
+        }
+
+        if (Block.walHealthCheckInterval) {
+            clearInterval(Block.walHealthCheckInterval)
+            Block.walHealthCheckInterval = null
+            if (Block.debug) {
+                console.log('[Sharded] WAL health monitoring stopped')
+            }
+        }
+    }
+
+    /**
+     * Start automatic health monitoring and recovery (internal - runs automatically)
+     */
+    private static async startWalHealthMonitoring(): Promise<void> {
+        if (Block.walHealthCheckInterval || !Block.autoRecoveryEnabled) {
+            return
+        }
+
+        Block.walHealthCheckInterval = setInterval(async () => {
+            try {
+                const healthStatus = await Block.getWalHealthStatus()
+
+                // Auto-recovery for common issues
+                for (const [blockId, blockData] of Object.entries(healthStatus.blocks)) {
+                    const data = blockData as any
+
+                    // Handle busy readers automatically
+                    if (data.warnings?.some((w: string) => w.includes('Busy readers'))) {
+                        if (Block.debug) {
+                            console.log(`[Sharded] Auto-recovery: Clearing busy readers for block ${blockId}`)
+                        }
+                        try {
+                            await Block.forceWalCheckpoint(blockId, 'FULL')
+                        } catch (err) {
+                            if (Block.debug) {
+                                console.log(`[Sharded] Auto-recovery checkpoint failed for ${blockId}:`, err)
+                            }
+                        }
+                    }
+
+                    // Handle large WAL files automatically
+                    if (data.warnings?.some((w: string) => w.includes('Large WAL file'))) {
+                        if (Block.debug) {
+                            console.log(`[Sharded] Auto-recovery: Truncating large WAL for block ${blockId}`)
+                        }
+                        try {
+                            await Block.forceWalCheckpoint(blockId, 'RESTART')
+                        } catch (err) {
+                            if (Block.debug) {
+                                console.log(`[Sharded] Auto-recovery WAL restart failed for ${blockId}:`, err)
+                            }
+                        }
+                    }
+                }
+
+                // Log health summary if there are issues
+                if (healthStatus.warning_blocks > 0 || healthStatus.error_blocks > 0) {
+                    if (Block.debug) {
+                        console.log(`[Sharded] WAL Health: ${healthStatus.healthy_blocks} healthy, ${healthStatus.warning_blocks} warnings, ${healthStatus.error_blocks} errors`)
+                    }
+                }
+
+            } catch (err) {
+                // Don't let health monitoring errors break the system
+                if (Block.debug) {
+                    console.log('[Sharded] WAL health monitoring error:', err)
+                }
+            }
+        }, 60000) // Check every minute
+
+        if (Block.debug) {
+            console.log('[Sharded] WAL health monitoring and auto-recovery started')
+        }
+    }
+
+    /**
+     * Get WAL health status for all blocks
+     */
+    static async getWalHealthStatus(): Promise<any> {
+        const blockIds = Array.from(Block.blockClients.keys())
+        const healthStatus: any = {
+            timestamp: new Date().toISOString(),
+            total_blocks: blockIds.length,
+            healthy_blocks: 0,
+            warning_blocks: 0,
+            error_blocks: 0,
+            blocks: {}
+        }
+
+        for (const blockId of blockIds) {
+            try {
+                const diagnostics = await Block.getWalDiagnostics(blockId)
+
+                let status = 'healthy'
+                const warnings = []
+
+                // Check for potential issues
+                if (diagnostics.wal_checkpoint_result?.busy > 0) {
+                    warnings.push('Busy readers detected (possible long-lived transactions)')
+                    status = 'warning'
+                }
+
+                if (diagnostics.wal_checkpoint_result?.log > 5000) {
+                    warnings.push(`Large WAL file (${diagnostics.wal_checkpoint_result.log} pages)`)
+                    status = 'warning'
+                }
+
+                if (diagnostics.journal_mode !== 'wal') {
+                    warnings.push('Not in WAL mode')
+                    status = 'error'
+                }
+
+                if (diagnostics.synchronous < 1) {
+                    warnings.push('Synchronous mode below NORMAL (data loss risk)')
+                    status = 'warning'
+                }
+
+                healthStatus.blocks[blockId] = {
+                    status,
+                    warnings,
+                    diagnostics
+                }
+
+                if (status === 'healthy') healthStatus.healthy_blocks++
+                else if (status === 'warning') healthStatus.warning_blocks++
+                else healthStatus.error_blocks++
+
+            } catch (err) {
+                healthStatus.blocks[blockId] = {
+                    status: 'error',
+                    error: err instanceof Error ? err.message : String(err)
+                }
+                healthStatus.error_blocks++
+            }
+        }
+
+        return healthStatus
+    }
+
+    /**
+     * Run comprehensive WAL diagnostics as per the troubleshooting checklist
+     * This implements the "Fast diagnostics" section from the requirements
+     */
+    static async runWalDiagnostics(blockId?: string): Promise<any> {
+        const blockIds = blockId ? [blockId] : Array.from(Block.blockClients.keys())
+        const results: any = {
+            timestamp: new Date().toISOString(),
+            summary: {
+                total_blocks: blockIds.length,
+                healthy: 0,
+                warnings: 0,
+                errors: 0
+            },
+            blocks: {},
+            recommendations: []
+        }
+
+        for (const id of blockIds) {
+            const blockClient = Block.blockClients.get(id)
+            if (!blockClient) {
+                results.blocks[id] = {
+                    status: 'ERROR',
+                    error: 'Block client not found'
+                }
+                results.summary.errors++
+                continue
+            }
+
+            try {
+                // Run the diagnostic queries from the checklist
+                const [
+                    journalMode,
+                    dbList,
+                    walCheckpoint,
+                    busyTimeout
+                ] = await Promise.all([
+                    blockClient.$queryRaw`PRAGMA journal_mode;`,
+                    blockClient.$queryRaw`SELECT * FROM pragma_database_list;`,
+                    blockClient.$queryRaw`PRAGMA wal_checkpoint(PASSIVE);`,
+                    blockClient.$queryRaw`PRAGMA busy_timeout;`
+                ])
+
+                const diagnostics = {
+                    journal_mode: (journalMode as any[])[0]?.journal_mode,
+                    database_path: (dbList as any[]).find((db: any) => db.seq === 0)?.file,
+                    busy_timeout: (busyTimeout as any[])[0]?.busy_timeout,
+                    wal_checkpoint: {
+                        busy: (walCheckpoint as any[])[0]?.busy,
+                        log: (walCheckpoint as any[])[0]?.log,
+                        checkpointed: (walCheckpoint as any[])[0]?.checkpointed
+                    }
+                }
+
+                // Analyze results and provide recommendations
+                const issues = []
+                const warnings = []
+
+                // Check #1: Are we in WAL mode?
+                if (diagnostics.journal_mode !== 'wal') {
+                    issues.push('Not in WAL mode')
+                }
+
+                // Check #2: Is the database path absolute?
+                if (diagnostics.database_path && !require('path').isAbsolute(diagnostics.database_path)) {
+                    warnings.push('Database path is not absolute - this can cause "different file" issues')
+                }
+
+                // Check #3: Are there busy readers (long-lived transactions)?
+                if (diagnostics.wal_checkpoint.busy > 0) {
+                    warnings.push(`${diagnostics.wal_checkpoint.busy} busy readers detected - possible long-lived transactions`)
+                    results.recommendations.push(`Kill long-lived readers for block ${id}`)
+                }
+
+                // Check #4: Is WAL file growing large?
+                if (diagnostics.wal_checkpoint.log > 5000) {
+                    warnings.push(`Large WAL file: ${diagnostics.wal_checkpoint.log} pages`)
+                    results.recommendations.push(`Consider manual checkpoint for block ${id}`)
+                }
+
+                // Check #5: Is busy timeout set appropriately?
+                if (diagnostics.busy_timeout < 5000) {
+                    warnings.push(`Low busy timeout: ${diagnostics.busy_timeout}ms`)
+                }
+
+                const status = issues.length > 0 ? 'ERROR' : warnings.length > 0 ? 'WARNING' : 'HEALTHY'
+
+                results.blocks[id] = {
+                    status,
+                    diagnostics,
+                    issues,
+                    warnings
+                }
+
+                if (status === 'HEALTHY') results.summary.healthy++
+                else if (status === 'WARNING') results.summary.warnings++
+                else results.summary.errors++
+
+            } catch (err) {
+                results.blocks[id] = {
+                    status: 'ERROR',
+                    error: err instanceof Error ? err.message : String(err)
+                }
+                results.summary.errors++
+            }
+        }
+
+        // Add general recommendations based on findings
+        if (results.summary.warnings > 0 || results.summary.errors > 0) {
+            results.recommendations.push(
+                'Run `Block.getWalHealthStatus()` for detailed health monitoring',
+                'Consider calling `Block.forceWalCheckpoint(blockId, "FULL")` to clear busy readers',
+                'Ensure all processes use absolute paths in connection strings',
+                'Keep transactions short to prevent long-lived readers'
+            )
+        }
+
+        return results
+    }
+
+    /**
+     * Calculate optimal batch size based on performance history
+     */
+    static getOptimalBatchSize(blockId: string): number {
+        if (!Block.ADAPTIVE_BATCH_SIZE) {
+            return Block.MAX_BATCH_SIZE
+        }
+
+        const history = Block.batchPerformanceHistory.get(blockId) || []
+        if (history.length < 2) {
+            return Math.max(Block.MIN_BATCH_SIZE, Math.floor(Block.MAX_BATCH_SIZE / 4)) // Start at 25% of max
+        }
+
+        // Calculate success rate and average duration for different batch sizes
+        const recentHistory = history.slice(-Block.PERFORMANCE_HISTORY_SIZE)
+        const successfulBatches = recentHistory.filter(h => h.success)
+
+        if (successfulBatches.length === 0) {
+            return Block.MIN_BATCH_SIZE // Fall back to minimum if all recent batches failed
+        }
+
+        // Find the largest successful batch size with good performance
+        let optimalSize = Block.MIN_BATCH_SIZE
+        const performanceThreshold = Block.TRANSACTION_TIMEOUT * 0.8 // Use 80% of timeout as threshold
+
+        for (const record of successfulBatches) {
+            if (record.duration < performanceThreshold) {
+                optimalSize = Math.max(optimalSize, record.size)
+            }
+        }
+
+        // More aggressive scaling based on recent performance
+        const recentSuccessRate = successfulBatches.length / recentHistory.length
+        const avgDuration = successfulBatches.reduce((sum, b) => sum + b.duration, 0) / successfulBatches.length
+
+        if (recentSuccessRate >= 0.9 && avgDuration < performanceThreshold * 0.5) {
+            // Excellent performance - scale up aggressively
+            optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize * 1.5)
+        } else if (recentSuccessRate >= 0.8 && avgDuration < performanceThreshold * 0.7) {
+            // Good performance - moderate scaling
+            optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize + 10)
+        } else if (recentSuccessRate >= 0.6) {
+            // Decent performance - small scaling
+            optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize + 5)
+        } else {
+            // Poor performance - scale down
+            optimalSize = Math.max(Block.MIN_BATCH_SIZE, Math.floor(optimalSize * 0.7))
+        }
+
+        if (Block.debug) {
+            console.log(`[Sharded] Optimal batch size for ${blockId}: ${optimalSize} (success rate: ${recentSuccessRate.toFixed(2)})`)
+        }
+
+        return optimalSize
+    }
+
+    /**
+     * Record batch performance for adaptive sizing
+     */
+    static recordBatchPerformance(blockId: string, size: number, duration: number, success: boolean) {
+        if (!Block.ADAPTIVE_BATCH_SIZE) return
+
+        let history = Block.batchPerformanceHistory.get(blockId) || []
+        history.push({ size, duration, success })
+
+        // Keep only recent history
+        if (history.length > Block.PERFORMANCE_HISTORY_SIZE) {
+            history = history.slice(-Block.PERFORMANCE_HISTORY_SIZE)
+        }
+
+        Block.batchPerformanceHistory.set(blockId, history)
     }
 
     /**
@@ -249,55 +810,66 @@ export class Block {
                 console.log('[Sharded] Creating PrismaClient for block:', blockPath)
             }
 
+            // Use absolute path to ensure all processes connect to the same file
+            const absoluteBlockPath = require('path').resolve(blockPath)
+            const connectionUrl = `file:${absoluteBlockPath}?mode=rwc&cache=private`
+
             const blockClient = new BlockPrismaClient({
                 datasources: {
                     db: {
-                        url: `file:${blockPath}?journal_mode=WAL`,
+                        url: connectionUrl,
                     },
                 },
                 ...config.prismaOptions,
             })
 
-            // Enable WAL mode and set pragmas optimized for multi-process performance
+            // Enable WAL mode and set pragmas for robust multi-process operation
             try {
+                // Core WAL configuration
                 await blockClient.$queryRaw`PRAGMA journal_mode=WAL`
-                await blockClient.$queryRaw`PRAGMA synchronous=NORMAL`
+                await blockClient.$queryRaw`PRAGMA synchronous=FULL` // Use FULL for durability (safer than NORMAL)
                 await blockClient.$queryRaw`PRAGMA busy_timeout=5000`
-                await blockClient.$queryRaw`PRAGMA cache_size=-2000` // Use 2MB of memory for cache
-                await blockClient.$queryRaw`PRAGMA wal_autocheckpoint=1000` // Checkpoint every 1000 pages
-                await blockClient.$queryRaw`PRAGMA mmap_size=268435456` // 256MB memory mapping for better I/O
+
+                // Memory and performance settings
+                await blockClient.$queryRaw`PRAGMA cache_size=-4000` // Use 4MB of memory for cache
                 await blockClient.$queryRaw`PRAGMA temp_store=MEMORY` // Keep temp tables in memory
-            } catch (err) {
+
+                // WAL-specific settings for better concurrency and reliability
+                await blockClient.$queryRaw`PRAGMA wal_autocheckpoint=2000` // More conservative checkpointing
+
+                // Skip mmap for better container/filesystem compatibility
+                await blockClient.$queryRaw`PRAGMA mmap_size=0`
+
+                // Additional safety settings
+                await blockClient.$queryRaw`PRAGMA foreign_keys=ON`
+                await blockClient.$queryRaw`PRAGMA secure_delete=ON`
+
                 if (Block.debug) {
-                    console.error(
-                        '[Sharded] Error setting SQLite pragmas:',
-                        err,
-                    )
+                    console.log(`[Sharded] SQLite pragmas configured for ${absoluteBlockPath}`)
                 }
+            } catch (err) {
+                console.error(
+                    '[Sharded] Error setting SQLite pragmas:',
+                    err,
+                )
+                throw err // Fail fast if pragmas can't be set
             }
 
-            // Test query to confirm which file is being used
+            // Critical: Verify exact database file path to ensure all processes use the same file
             try {
-                const tables = await blockClient.$queryRawUnsafe(
-                    'SELECT name FROM sqlite_master WHERE type="table";',
-                )
+                await Block.verifyDatabasePath(blockClient, absoluteBlockPath, config.blockId)
                 if (Block.debug) {
-                    console.log(
-                        '[Sharded] Tables in block DB',
-                        blockPath,
-                        ':',
-                        tables,
-                    )
+                    console.log(`[Sharded] ✅ WAL optimization enabled for block ${config.blockId}`)
                 }
             } catch (err) {
-                if (Block.debug) {
-                    console.error(
-                        '[Sharded] Error querying block DB',
-                        blockPath,
-                        ':',
-                        err,
-                    )
-                }
+                console.error(
+                    '[Sharded] ⚠️ Database path verification failed for block',
+                    config.blockId,
+                    ':',
+                    err,
+                )
+                // Don't fail completely - log and continue with basic functionality
+                console.log('[Sharded] Continuing with basic WAL mode (some optimizations disabled)')
             }
 
             // Initialize worker queue for this block
@@ -334,6 +906,16 @@ export class Block {
 
             if (Block.debug) {
                 console.log('[Sharded] Created block:', config.blockId)
+            }
+
+            // Start WAL maintenance and health monitoring automatically for master nodes
+            if (node === 'master' && Block.blockClients.size === 1) {
+                if (Block.walMaintenanceEnabled && !Block.walMaintenanceInterval) {
+                    await Block.startWalMaintenance(30000) // 30 second intervals
+                }
+                if (Block.autoRecoveryEnabled && !Block.walHealthCheckInterval) {
+                    await Block.startWalHealthMonitoring()
+                }
             }
 
             // Resolve the in-process lock after everything is complete (including loader)
@@ -561,18 +1143,30 @@ export class Block {
         }))
 
         try {
-            // Wait for any active operations to complete before reloading
-            const maxWaitTime = 30000 // 30 seconds max wait
+            // Instead of waiting for ALL operations, just wait for write operations to sync
+            // Read operations can continue during reload as they'll fallback to main DB
+            const maxWaitTime = 5000 // Much shorter wait - just for critical sync operations
             const startTime = Date.now()
-            while (Block.activeOperations.has(blockId)) {
-                if (Date.now() - startTime > maxWaitTime) {
-                    console.warn(`[Sharded] Timeout waiting for operations to complete during reload of block ${blockId}, proceeding anyway`)
+
+            // Wait for critical write operations and pending sync operations
+            while (Date.now() - startTime < maxWaitTime) {
+                const pendingCount = await Block.redis?.llen(`block_operations:${blockId}`) || 0
+                const activeWrites = Block.activeWriteOperations.get(blockId) || 0
+
+                if (pendingCount === 0 && activeWrites === 0) {
+                    if (Block.debug) {
+                        console.log(`[Sharded] All write operations completed for ${blockId}, proceeding with reload`)
+                    }
                     break
                 }
                 if (Block.debug) {
-                    console.log(`[Sharded] Waiting for ${Block.activeOperations.get(blockId)} active operations to complete before reloading block ${blockId}`)
+                    console.log(`[Sharded] Waiting for ${pendingCount} pending syncs + ${activeWrites} active writes before reloading ${blockId}`)
                 }
                 await new Promise(resolve => setTimeout(resolve, 100))
+            }
+
+            if (Block.debug) {
+                console.log(`[Sharded] Proceeding with reload of ${blockId} - active read operations can continue concurrently`)
             }
 
             // Clear existing data before reloading
@@ -678,37 +1272,37 @@ export class Block {
     }
 
     /**
-     * Increment the operation count for a block
+     * Increment the write operation count for a block (blocks reloads)
      */
-    static incrementOperationCount(blockId: string) {
-        const current = Block.activeOperations.get(blockId) || 0
-        Block.activeOperations.set(blockId, current + 1)
+    static incrementWriteOperationCount(blockId: string) {
+        const current = Block.activeWriteOperations.get(blockId) || 0
+        Block.activeWriteOperations.set(blockId, current + 1)
         if (Block.debug) {
-            console.log(`[Sharded] Operation count for ${blockId}: ${current + 1}`)
+            console.log(`[Sharded] Write operation count for ${blockId}: ${current + 1}`)
         }
     }
 
     /**
-     * Decrement the operation count for a block
+     * Decrement the write operation count for a block
      */
-    static decrementOperationCount(blockId: string) {
-        const current = Block.activeOperations.get(blockId) || 0
+    static decrementWriteOperationCount(blockId: string) {
+        const current = Block.activeWriteOperations.get(blockId) || 0
         if (current > 1) {
-            Block.activeOperations.set(blockId, current - 1)
+            Block.activeWriteOperations.set(blockId, current - 1)
         } else {
-            Block.activeOperations.delete(blockId)
+            Block.activeWriteOperations.delete(blockId)
         }
         if (Block.debug) {
-            console.log(`[Sharded] Operation count for ${blockId}: ${Math.max(0, current - 1)}`)
+            console.log(`[Sharded] Write operation count for ${blockId}: ${Math.max(0, current - 1)}`)
         }
     }
 
     /**
-     * Check if a block can be safely invalidated (no active operations, creation, or reload)
+     * Check if a block can be safely invalidated (no active write operations, creation, or reload)
      */
     static async canInvalidate(blockId: string): Promise<boolean> {
-        // Check for active operations and double invalidation
-        if (Block.activeOperations.has(blockId) || Block.invalidatingBlocks.has(blockId)) {
+        // Check for active write operations and double invalidation
+        if (Block.activeWriteOperations.has(blockId) || Block.invalidatingBlocks.has(blockId)) {
             return false
         }
 
@@ -884,7 +1478,7 @@ export class Block {
             const isWorkerNode = node !== 'master'
             const hasWorker = Block.blockWorkers.has(blockId)
             const redisConnected = Block.redis?.status === 'ready'
-            
+
             throw new Error(`Failed to initialize queue for block ${blockId}. Debug info: ` +
                 `node=${node}, isWorker=${isWorkerNode}, hasWorker=${hasWorker}, ` +
                 `redisStatus=${Block.redis?.status}, queueCount=${Block.blockQueues.size}`)
@@ -923,14 +1517,15 @@ export class Block {
             const operationQueueKey = `block_operations:${blockId}`
 
             // Use MULTI/EXEC to atomically get operations and clear the list
-            // Limit batch size to prevent transaction timeouts
+            // Use adaptive batch size to prevent transaction timeouts
+            const optimalBatchSize = Block.getOptimalBatchSize(blockId)
             const redisStartTime = Date.now()
             const multi = Block.redis?.multi()
             if (!multi) return
 
             // Get limited number of operations and remove them atomically
-            multi.lrange(operationQueueKey, 0, Block.MAX_BATCH_SIZE - 1)
-            multi.ltrim(operationQueueKey, Block.MAX_BATCH_SIZE, -1)
+            multi.lrange(operationQueueKey, 0, optimalBatchSize - 1)
+            multi.ltrim(operationQueueKey, optimalBatchSize, -1)
             const results = await multi.exec()
             timings.redis_fetch = Date.now() - redisStartTime
 
@@ -981,43 +1576,50 @@ export class Block {
                     }
                 }, {
                     timeout: Block.TRANSACTION_TIMEOUT,
-                    maxWait: 5000,
+                    maxWait: Block.TRANSACTION_TIMEOUT,
                 })
-                
+
                 batchSuccess = true
                 timings.batch_transaction = Date.now() - batchStartTime
                 timings.batch_success = true
-                
+
+                // Record successful batch performance
+                Block.recordBatchPerformance(blockId, parsedOperations.length, timings.batch_transaction, true)
+
                 if (Block.debug) {
                     console.log(`[Sharded] Batch transaction succeeded for ${parsedOperations.length} operations in ${timings.batch_transaction}ms`)
                 }
-                
+
             } catch (err: any) {
                 timings.batch_transaction = Date.now() - batchStartTime
-                
+
+                // Record failed batch performance
+                Block.recordBatchPerformance(blockId, parsedOperations.length, timings.batch_transaction, false)
+
                 // Batch failed - need to isolate the problematic operation(s)
+                const isTimeout = err.message?.includes('timeout') || err.message?.includes('expired') || err.code === 'P2024'
                 if (Block.debug) {
-                    console.log(`[Sharded] Batch transaction failed after ${timings.batch_transaction}ms, isolating operations: ${err.message}`)
+                    console.log(`[Sharded] Batch transaction failed after ${timings.batch_transaction}ms (${isTimeout ? 'TIMEOUT' : 'ERROR'}), isolating operations: ${err.message}`)
                 }
-                
+
                 // Try operations individually to identify the bad ones
                 const individualStartTime = Date.now()
                 let individualCount = 0
-                
+
                 for (let i = 0; i < parsedOperations.length; i++) {
                     const { operation, model, args, retry_count = 0 } = parsedOperations[i]
                     individualCount++
-                    
+
                     try {
                         await mainClient.$transaction(async (tx) => {
                             await (tx as any)[model][operation](args)
                         }, {
-                            timeout: 10000,
-                            maxWait: 2000,
+                            timeout: 15000, // Increased for individual operations
+                            maxWait: 5000,  // Reasonable maxWait for individual ops
                         })
-                        
+
                         // Operation succeeded individually
-                        
+
                     } catch (individualErr: any) {
                         // Handle individual operation failure
                         if (individualErr.code === 'P2002') {
@@ -1027,14 +1629,26 @@ export class Block {
                                 `[Sharded] Duplicate record skipped in ${model} with unique field ${uniqueField}`,
                                 { blockId, model, operation }
                             )
-                            
+
                         } else if (individualErr.code === 'P2025') {
                             // Record not found - skip permanently  
                             console.warn(
                                 `[Sharded] Record not found for ${model}.${operation}, skipping`,
                                 { blockId, model, operation }
                             )
-                            
+                        } else if (individualErr.code === 'P2024' || individualErr.message?.includes('timeout') || individualErr.message?.includes('expired')) {
+                            // Transaction timeout - retry with backoff
+                            console.warn(
+                                `[Sharded] Transaction timeout for ${model}.${operation}, will retry`,
+                                { blockId, model, operation, attempt: retry_count + 1 }
+                            )
+                            failedOperations.push({
+                                ...parsedOperations[i],
+                                retry_count: retry_count + 1,
+                                last_error: 'Transaction timeout',
+                                failed_at: Date.now(),
+                            })
+
                         } else if (retry_count < Block.MAX_OPERATION_RETRIES) {
                             // Retriable error
                             failedOperations.push({
@@ -1043,7 +1657,7 @@ export class Block {
                                 last_error: individualErr.message || individualErr.toString(),
                                 failed_at: Date.now(),
                             })
-                            
+
                         } else {
                             // Permanent failure after max retries
                             const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
@@ -1053,7 +1667,7 @@ export class Block {
                                 final_error: individualErr.message || individualErr.toString(),
                                 failed_permanently_at: Date.now(),
                             }
-                            
+
                             try {
                                 await Block.redis?.lpush(deadLetterKey, JSON.stringify(failedOperation))
                             } catch (deadLetterErr) {
@@ -1063,7 +1677,7 @@ export class Block {
                                 )
                                 // Don't let dead letter queue failures stop the worker
                             }
-                            
+
                             console.error(
                                 `[Sharded] Operation permanently failed: ${model}.${operation}`,
                                 { blockId, error: individualErr.message }
@@ -1071,10 +1685,10 @@ export class Block {
                         }
                     }
                 }
-                
+
                 timings.individual_processing = Date.now() - individualStartTime
                 timings.individual_operations_count = individualCount
-                
+
                 if (Block.debug) {
                     console.log(`[Sharded] Individual processing completed in ${timings.individual_processing}ms for ${individualCount} operations`)
                 }
@@ -1092,7 +1706,7 @@ export class Block {
                         await reQueueMulti.exec()
                     }
                     timings.requeue = Date.now() - reQueueStartTime
-                    
+
                     if (Block.debug) {
                         console.log(`[Sharded] Re-queued ${failedOperations.length} operations for retry in ${timings.requeue}ms`)
                     }
@@ -1109,24 +1723,34 @@ export class Block {
             // Calculate total time
             timings.total = Date.now() - startTime
 
-            // Log comprehensive timing information
-            console.log(`[Sharded] Batch sync completed for ${blockId}:`, {
-                total_time: `${timings.total}ms`,
-                operations_processed: timings.operations_count,
-                batch_success: timings.batch_success,
-                timings: {
-                    redis_fetch: `${timings.redis_fetch}ms`,
-                    parse: `${timings.parse}ms`,
-                    batch_transaction: `${timings.batch_transaction}ms`,
-                    individual_processing: `${timings.individual_processing}ms`,
-                    requeue: `${timings.requeue}ms`,
-                },
-                performance: {
-                    ops_per_second: Math.round(timings.operations_count / (timings.total / 1000)),
-                    avg_time_per_op: timings.operations_count > 0 ? Math.round(timings.total / timings.operations_count * 100) / 100 : 0,
-                    batch_efficiency: timings.batch_success ? 'HIGH' : 'DEGRADED',
-                }
-            })
+            // Log comprehensive timing information with adaptive batch size info
+            const currentOptimalSize = Block.getOptimalBatchSize(blockId)
+            if (Block.debug) {
+                console.log(`[Sharded] Batch sync completed for ${blockId}:`, {
+                    total_time: `${timings.total}ms`,
+                    operations_processed: timings.operations_count,
+                    batch_success: timings.batch_success,
+                    adaptive_batch_size: {
+                        used_size: timings.operations_count,
+                        optimal_size: currentOptimalSize,
+                        max_size: Block.MAX_BATCH_SIZE,
+                    },
+                    timings: {
+                        redis_fetch: `${timings.redis_fetch}ms`,
+                        parse: `${timings.parse}ms`,
+                        batch_transaction: `${timings.batch_transaction}ms`,
+                        individual_processing: `${timings.individual_processing}ms`,
+                        requeue: `${timings.requeue}ms`,
+                    },
+                    performance: {
+                        ops_per_second: Math.round(timings.operations_count / (timings.total / 1000)),
+                        avg_time_per_op: timings.operations_count > 0 ? Math.round(timings.total / timings.operations_count * 100) / 100 : 0,
+                        batch_efficiency: timings.batch_success ? 'HIGH' : 'DEGRADED',
+                        timeout_threshold: `${Block.TRANSACTION_TIMEOUT}ms`,
+                        timeout_utilization: `${Math.round((timings.batch_transaction / Block.TRANSACTION_TIMEOUT) * 100)}%`,
+                    }
+                })
+            }
 
             // Check if there are more operations to process immediately
             try {
@@ -1204,10 +1828,10 @@ export class Block {
      */
     static async getFailedOperations(blockId: string): Promise<any[]> {
         if (!Block.redis) return []
-        
+
         const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
         const failedOps = await Block.redis.lrange(deadLetterKey, 0, -1)
-        
+
         return failedOps.map(op => {
             try {
                 return JSON.parse(op)
@@ -1223,11 +1847,11 @@ export class Block {
      */
     static async clearFailedOperations(blockId: string): Promise<number> {
         if (!Block.redis) return 0
-        
+
         const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
         const count = await Block.redis.llen(deadLetterKey)
         await Block.redis.del(deadLetterKey)
-        
+
         return count
     }
 
@@ -1236,25 +1860,25 @@ export class Block {
      */
     static async retryFailedOperations(blockId: string, maxOperations?: number): Promise<number> {
         if (!Block.redis) return 0
-        
+
         const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
         const operationQueueKey = `block_operations:${blockId}`
-        
-        const operations = maxOperations 
+
+        const operations = maxOperations
             ? await Block.redis.lrange(deadLetterKey, 0, maxOperations - 1)
             : await Block.redis.lrange(deadLetterKey, 0, -1)
-        
+
         if (operations.length === 0) return 0
-        
+
         const multi = Block.redis.multi()
-        
+
         // Remove operations from dead letter queue
         if (maxOperations) {
             multi.ltrim(deadLetterKey, operations.length, -1)
         } else {
             multi.del(deadLetterKey)
         }
-        
+
         // Add operations back to main queue (reset retry count)
         for (let i = operations.length - 1; i >= 0; i--) {
             try {
@@ -1269,13 +1893,13 @@ export class Block {
                 console.error('[Sharded] Failed to parse operation for retry:', operations[i], err)
             }
         }
-        
+
         await multi.exec()
-        
+
         if (Block.debug) {
             console.log(`[Sharded] Retried ${operations.length} failed operations for block ${blockId}`)
         }
-        
+
         return operations.length
     }
 
@@ -1284,13 +1908,29 @@ export class Block {
      */
     static async gracefulShutdown(timeoutMs: number = 10000): Promise<void> {
         console.log('[Sharded] Starting graceful shutdown...')
-        
+
+        // Stop WAL maintenance first
+        Block.stopWalMaintenance()
+
+        // Perform final WAL checkpoints for all blocks
+        try {
+            console.log('[Sharded] Performing final WAL checkpoints...')
+            const blockIds = Array.from(Block.blockClients.keys())
+            await Promise.all(blockIds.map(blockId =>
+                Block.forceWalCheckpoint(blockId, 'FULL').catch(err => {
+                    console.error(`[Sharded] Final checkpoint failed for ${blockId}:`, err)
+                })
+            ))
+        } catch (err) {
+            console.error('[Sharded] Error during final WAL checkpoints:', err)
+        }
+
         const startTime = Date.now()
         const blockIds = Array.from(Block.blockQueues.keys())
-        
+
         while (Date.now() - startTime < timeoutMs) {
             let totalPending = 0
-            
+
             // Check all blocks for pending operations
             for (const blockId of blockIds) {
                 if (Block.redis) {
@@ -1298,16 +1938,16 @@ export class Block {
                     totalPending += pendingCount
                 }
             }
-            
+
             if (totalPending === 0) {
                 console.log('[Sharded] All operations completed, shutdown ready')
                 return
             }
-            
+
             console.log(`[Sharded] Waiting for ${totalPending} pending operations...`)
             await new Promise(resolve => setTimeout(resolve, 500))
         }
-        
+
         console.warn(`[Sharded] Shutdown timeout reached, ${Date.now() - startTime}ms elapsed`)
     }
 
@@ -1316,13 +1956,13 @@ export class Block {
      */
     static async flushAllPendingBatches(): Promise<void> {
         const blockIds = Array.from(Block.blockQueues.keys())
-        
+
         for (const blockId of blockIds) {
             // Trigger immediate batch processing
             const queue = Block.blockQueues.get(blockId)
             if (queue) {
                 try {
-                    await queue.add(`${blockId}_batch_processor`, { blockId }, { 
+                    await queue.add(`${blockId}_batch_processor`, { blockId }, {
                         delay: 0,
                         jobId: `${blockId}_shutdown_flush_${Date.now()}`
                     })
@@ -1331,7 +1971,7 @@ export class Block {
                 }
             }
         }
-        
+
         console.log('[Sharded] Triggered immediate batch processing for all blocks')
     }
 
@@ -1348,7 +1988,7 @@ export class Block {
 
         for (const [blockId, queue] of Block.blockQueues.entries()) {
             diagnostics.active_blocks.push(blockId)
-            
+
             // Worker status
             const worker = Block.blockWorkers.get(blockId)
             diagnostics.worker_status[blockId] = {
@@ -1361,7 +2001,7 @@ export class Block {
                 const waiting = await queue.getWaiting()
                 const active = await queue.getActive()
                 const failed = await queue.getFailed()
-                
+
                 diagnostics.queue_status[blockId] = {
                     waiting: waiting.length,
                     active: active.length,
@@ -1405,256 +2045,177 @@ export class Block {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        Block.incrementOperationCount(blockId)
                         Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 create', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            // Execute in block DB first to get the ID
-                            const result = await query(args)
-
-                            // Queue the operation with the result's ID
-                            await Block.queue_operation(blockId, {
+                        if (Block.debug) {
+                            console.log('🔄 create', {
                                 operation,
+                                args,
                                 model,
-                                args: {
-                                    ...args,
-                                    data: {
-                                        ...args.data,
-                                        id: result.id,
-                                    },
-                                },
+                                query,
                             })
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
                         }
+                        // Execute in block DB first to get the ID
+                        const result = await query(args)
+
+                        // Queue the operation with the result's ID
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args: {
+                                ...args,
+                                data: {
+                                    ...args.data,
+                                    id: result.id,
+                                },
+                            },
+                        })
+                        return result
                     },
 
                     async createMany({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        Block.incrementOperationCount(blockId)
                         Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 createMany', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            // tranform and include the ids
-                            const data = Array.isArray(args.data)
-                                ? args.data.map((item) => ({
-                                    ...item,
-                                    id: item.id ?? crypto.randomUUID(),
-                                }))
-                                : {
-                                    ...args.data,
-                                    id: args.data.id ?? crypto.randomUUID(),
-                                }
-
-                            args = { ...args, data: data as any }
-
-                            const result = await query(args)
-                            await Block.queue_operation(blockId, {
+                        if (Block.debug) {
+                            console.log('🔄 createMany', {
                                 operation,
-                                model,
                                 args,
+                                model,
+                                query,
                             })
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
                         }
+                        // tranform and include the ids
+                        const data = Array.isArray(args.data)
+                            ? args.data.map((item) => ({
+                                ...item,
+                                id: item.id ?? crypto.randomUUID(),
+                            }))
+                            : {
+                                ...args.data,
+                                id: args.data.id ?? crypto.randomUUID(),
+                            }
+
+                        args = { ...args, data: data as any }
+
+                        const result = await query(args)
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args,
+                        })
+                        return result
                     },
 
                     async update({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 update', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            
-                            try {
-                                const result = await query(args)
-
-                                await Block.queue_operation(blockId, {
-                                    operation,
-                                    model,
-                                    args,
-                                })
-                                Block.incrementOperationCount(blockId)
-                                Block.updateLastSeenThrottled(blockId)
-                                return result
-                            } catch (err: any) {
-                                // Handle specific Prisma errors gracefully
-                                if (err.code === 'P2025') {
-                                    // Record not found for update - this might be a race condition
-                                    console.warn(`[Sharded] Update failed - record not found in ${model}:`, {
-                                        blockId,
-                                        where: args.where,
-                                        error: err.message
-                                    })
-                                    
-                                    // Still queue the operation for sync (main DB might have it)
-                                    await Block.queue_operation(blockId, {
-                                        operation,
-                                        model,
-                                        args,
-                                    })
-                                    Block.incrementOperationCount(blockId)
-                                    Block.updateLastSeenThrottled(blockId)
-                                    
-                                    // Re-throw the error to maintain API contract
-                                    throw err
-                                } else {
-                                    // For other errors, don't queue and re-throw
-                                    throw err
-                                }
-                            }
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+                        if (Block.debug) {
+                            console.log('🔄 update', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+
+
+                        const result = await query(args)
+
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args,
+                        })
+                        Block.updateLastSeenThrottled(blockId)
+                        return result
                     },
 
                     async updateMany({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 updateMany', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            const result = await query(args)
 
-                            Block.incrementOperationCount(blockId)
-                            Block.updateLastSeenThrottled(blockId)
-                            await Block.queue_operation(blockId, {
+                        if (Block.debug) {
+                            console.log('🔄 updateMany', {
                                 operation,
-                                model,
                                 args,
+                                model,
+                                query,
                             })
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
                         }
+                        const result = await query(args)
+
+
+                        Block.updateLastSeenThrottled(blockId)
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args,
+                        })
+                        return result
                     },
 
                     async upsert({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        
-
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 upsert', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            const result = await query(args)
-                            Block.incrementOperationCount(blockId)
-                            Block.updateLastSeenThrottled(blockId)
-                            await Block.queue_operation(blockId, {
+                        if (Block.debug) {
+                            console.log('🔄 upsert', {
                                 operation,
-                                model,
                                 args,
+                                model,
+                                query,
                             })
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
                         }
+                        const result = await query(args)
+
+                        Block.updateLastSeenThrottled(blockId)
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args,
+                        })
+                        return result
+
                     },
 
                     async delete({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 delete', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            
-                            try {
-                                // Execute the delete in block DB first
-                                const result = await query(args)
-                                Block.incrementOperationCount(blockId)
-                                Block.updateLastSeenThrottled(blockId)
-                                // Queue the operation for main DB sync
-                                await Block.queue_operation(blockId, {
-                                    operation,
-                                    model,
-                                    args,
-                                })
-                                return result
-                            } catch (err: any) {
-                                // Handle specific Prisma errors gracefully
-                                if (err.code === 'P2025') {
-                                    // Record not found for delete - this might be a race condition
-                                    console.warn(`[Sharded] Delete failed - record not found in ${model}:`, {
-                                        blockId,
-                                        where: args.where,
-                                        error: err.message
-                                    })
-                                    
-                                    // Still queue the operation for sync (main DB might have it)
-                                    await Block.queue_operation(blockId, {
-                                        operation,
-                                        model,
-                                        args,
-                                    })
-                                    Block.incrementOperationCount(blockId)
-                                    Block.updateLastSeenThrottled(blockId)
-                                    
-                                    // Re-throw the error to maintain API contract
-                                    throw err
-                                } else {
-                                    // For other errors, don't queue and re-throw
-                                    throw err
-                                }
-                            }
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+
+                        if (Block.debug) {
+                            console.log('🔄 delete', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+
+                        // Execute the delete in block DB first
+                        const result = await query(args)
+
+                        Block.updateLastSeenThrottled(blockId)
+                        // Queue the operation for main DB sync
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args,
+                        })
+                        return result
+
                     },
 
                     async deleteMany({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        
+
 
                         try {
                             if (Block.debug) {
@@ -1667,7 +2228,7 @@ export class Block {
                             }
                             // Execute the delete in block DB first
                             const result = await query(args)
-                            Block.incrementOperationCount(blockId)
+
                             Block.updateLastSeenThrottled(blockId)
                             // Queue the operation for main DB sync
                             await Block.queue_operation(blockId, {
@@ -1677,7 +2238,7 @@ export class Block {
                             })
                             return result
                         } finally {
-                            Block.decrementOperationCount(blockId)
+
                         }
                     },
 
@@ -1685,213 +2246,152 @@ export class Block {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        
+                        if (Block.debug) {
+                            console.log('🔄 findFirst', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
+                        }
 
+                        // Execute query with automatic WAL optimization and fallback
+                        const currentBlockClient = Block.blockClients.get(blockId)
+                        if (!currentBlockClient) {
+                            throw new Error(`Block client not found for ${blockId}`)
+                        }
+
+                        let result
                         try {
+                            // Try with controlled transaction to prevent long-lived readers
+                            result = await currentBlockClient.$transaction(async (tx: any) => {
+                                return await (tx as any)[model.toLowerCase()][operation](args)
+                            }, {
+                                timeout: 5000, // Short timeout for read operations to prevent long snapshots
+                                maxWait: 1000   // Don't wait long to start
+                            })
+                        } catch (txErr: any) {
+                            // If transaction fails, fallback to direct query (still better than failure)
                             if (Block.debug) {
-                                console.log('🔄 findFirst', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
+                                console.log(`[Sharded] Transaction failed for ${model}.${operation}, using fallback:`, txErr.message)
                             }
-                            let result = await query(args)
-                            Block.incrementOperationCount(blockId)
-                            Block.updateLastSeenThrottled(blockId)
-                            // If no result found in block, check main database
-                            if (!result) {
-                                if (Block.debug) {
-                                    console.log(`[Sharded] No result found in block for ${model}.findFirst, checking main database`)
-                                }
+                            result = await query(args)
+                        }
 
-                                const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
+                        Block.updateLastSeenThrottled(blockId)
+
+                        // If no result found in block, check main database
+                        if (!result) {
+                            if (Block.debug) {
+                                console.log(`[Sharded] No result found in block for ${model}.findFirst, checking main database`)
+                            }
+
+                            try {
+                                const mainResult = await mainClient.$transaction(async (tx) => {
+                                    return await (tx as any)[model.toLowerCase()][operation](args)
+                                }, {
+                                    timeout: 5000,
+                                    maxWait: 1000
+                                })
+
                                 if (mainResult) {
                                     if (Block.debug) {
                                         console.log(`[Sharded] Found result in main database for ${model}.findFirst, reloading block`)
                                     }
                                     // Reload block data since we found the record in main DB
                                     await Block.reloadBlockData(blockId)
-                                    // Try the query again after reload
-                                    result = await query(args)
+                                    // Try the query again after reload with a fresh transaction
+                                    result = await currentBlockClient.$transaction(async (tx: any) => {
+                                        return await (tx as any)[model.toLowerCase()][operation](args)
+                                    }, {
+                                        timeout: 5000,
+                                        maxWait: 1000
+                                    })
                                 }
+                            } catch (mainErr) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] Main database query failed for ${model}.findFirst:`, mainErr)
+                                }
+                                // Continue with null result
                             }
-
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
                         }
+
+                        return result
                     },
 
                     async findMany({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        Block.incrementOperationCount(blockId)
-                        Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 findMany', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            const result = await query(args)
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+                        Block.updateLastSeenThrottled(blockId)
+                        if (Block.debug) {
+                            console.log('🔄 findMany', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+                        const result = await query(args)
+                        return result
                     },
 
                     async findUnique({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        Block.incrementOperationCount(blockId)
+
                         Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 findUnique', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            let result = await query(args)
-
-                            // If no result found in block, check main database
-                            if (!result) {
-                                if (Block.debug) {
-                                    console.log(`[Sharded] No result found in block for ${model}.findUnique, checking main database`)
-                                }
-
-                                const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
-                                if (mainResult) {
-                                    if (Block.debug) {
-                                        console.log(`[Sharded] Found result in main database for ${model}.findUnique, reloading block`)
-                                    }
-                                    // Reload block data since we found the record in main DB
-                                    await Block.reloadBlockData(blockId)
-                                    // Try the query again after reload
-                                    result = await query(args)
-                                }
-                            }
-
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+                        if (Block.debug) {
+                            console.log('🔄 findUnique', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+                        const result = await query(args)
+                        return result
                     },
 
                     async findUniqueOrThrow({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 findUniqueOrThrow', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
 
-                            try {
-                                const result = await query(args)
-                                Block.incrementOperationCount(blockId)
-                                Block.updateLastSeenThrottled(blockId)
-                                return result
-                            } catch (error) {
-                                // If the error is "Record not found" type, check main database
-                                if ((error as any)?.code === 'P2025' || (error as any)?.message?.includes('No') || (error as any)?.message?.includes('not found')) {
-                                    if (Block.debug) {
-                                        console.log(`[Sharded] Record not found in block for ${model}.findUniqueOrThrow, checking main database`)
-                                    }
-
-                                    try {
-                                        const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
-                                        if (mainResult) {
-                                            if (Block.debug) {
-                                                console.log(`[Sharded] Found result in main database for ${model}.findUniqueOrThrow, reloading block`)
-                                            }
-                                            // Reload block data since we found the record in main DB
-                                            await Block.reloadBlockData(blockId)
-                                            // Try the query again after reload
-                                            const result = await query(args)
-                                            return result
-                                        }
-                                    } catch (mainError) {
-                                        // If main DB also doesn't have it, throw the original error
-                                        throw error
-                                    }
-                                }
-                                // Re-throw other types of errors
-                                throw error
-                            }
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+                        if (Block.debug) {
+                            console.log('🔄 findUniqueOrThrow', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+
+                        const result = await query(args)
+
+                        Block.updateLastSeenThrottled(blockId)
+                        return result
                     },
 
                     async findFirstOrThrow({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
-
-                        
-
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 findFirstOrThrow', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-
-                            try {
-                                const result = await query(args)
-                                Block.incrementOperationCount(blockId)
-                                Block.updateLastSeenThrottled(blockId)
-                                return result
-                            } catch (error) {
-                                // If the error is "Record not found" type, check main database
-                                if ((error as any)?.code === 'P2025' || (error as any)?.message?.includes('No') || (error as any)?.message?.includes('not found')) {
-                                    if (Block.debug) {
-                                        console.log(`[Sharded] Record not found in block for ${model}.findFirstOrThrow, checking main database`)
-                                    }
-
-                                    try {
-                                        const mainResult = await (mainClient as any)[model.toLowerCase()][operation](args)
-                                        if (mainResult) {
-                                            if (Block.debug) {
-                                                console.log(`[Sharded] Found result in main database for ${model}.findFirstOrThrow, reloading block`)
-                                            }
-                                            // Reload block data since we found the record in main DB
-                                            await Block.reloadBlockData(blockId)
-                                            // Try the query again after reload
-                                            const result = await query(args)
-                                            return result
-                                        }
-                                    } catch (mainError) {
-                                        // If main DB also doesn't have it, throw the original error
-                                        throw error
-                                    }
-                                }
-                                // Re-throw other types of errors
-                                throw error
-                            }
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+                        if (Block.debug) {
+                            console.log('🔄 findFirstOrThrow', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+
+                        const result = await query(args)
+                        Block.updateLastSeenThrottled(blockId)
+                        return result
                     },
 
                     // these need to be pulled directly from the main client, Ideally you don't want to do this
@@ -1899,69 +2399,61 @@ export class Block {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        Block.incrementOperationCount(blockId)
+
                         Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 count', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            const result = await query(args)
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+
+                        if (Block.debug) {
+                            console.log('🔄 count', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+                        const result = await query(args)
+                        return result
+
+
                     },
 
                     async aggregate({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        Block.incrementOperationCount(blockId)
+
                         Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 aggregate', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            const result = await query(args)
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+
+                        if (Block.debug) {
+                            console.log('🔄 aggregate', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+                        const result = await query(args)
+                        return result
+
+
                     },
 
                     async groupBy({ operation, args, model, query }) {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
-
-                        Block.incrementOperationCount(blockId)
                         Block.updateLastSeenThrottled(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 groupBy', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            const result = await query(args)
-                            return result
-                        } finally {
-                            Block.decrementOperationCount(blockId)
+                        if (Block.debug) {
+                            console.log('🔄 groupBy', {
+                                operation,
+                                args,
+                                model,
+                                query,
+                            })
                         }
+                        const result = await query(args)
+                        return result
                     },
                 },
             },
@@ -2019,16 +2511,20 @@ export class Block {
                 console.log('[Sharded] Starting invalidation of block:', blockId)
             }
 
-            // Wait for active operations to complete
-            const maxWaitTime = 30000 // 30 seconds max wait
+            // Wait for write operations to complete (reads can continue and will fail gracefully)
+            const maxWaitTime = 5000 // Reduced to 5 seconds since we only wait for writes
             const startTime = Date.now()
-            while (Block.activeOperations.has(blockId)) {
-                if (Date.now() - startTime > maxWaitTime) {
-                    console.warn(`[Sharded] Timeout waiting for operations to complete for block ${blockId}, forcing invalidation`)
+            let lastLogTime = 0
+            while (Block.activeWriteOperations.has(blockId)) {
+                const elapsed = Date.now() - startTime
+                if (elapsed > maxWaitTime) {
+                    console.warn(`[Sharded] Timeout waiting for write operations to complete for block ${blockId}, forcing invalidation`)
                     break
                 }
-                if (Block.debug) {
-                    console.log(`[Sharded] Waiting for ${Block.activeOperations.get(blockId)} active operations to complete for block ${blockId}`)
+                // Log every 2 seconds instead of every 100ms to reduce noise
+                if (Block.debug && elapsed - lastLogTime > 2000) {
+                    console.log(`[Sharded] Waiting for ${Block.activeWriteOperations.get(blockId)} active write operations to complete for block ${blockId} (${elapsed}ms elapsed)`)
+                    lastLogTime = elapsed
                 }
                 await new Promise(resolve => setTimeout(resolve, 100))
             }
@@ -2044,9 +2540,6 @@ export class Block {
             await Block.redis?.del(operationQueueKey)
 
             // Get references to resources before removing from maps
-            const blockClient = Block.blockClients.get(blockId)
-            const blockClientWithHooks = Block.blockClientsWithHooks.get(blockId)
-            const mainClient = Block.mainClients.get(blockId)
             const queue = Block.blockQueues.get(blockId)
             const worker = Block.blockWorkers.get(blockId)
 

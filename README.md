@@ -5,6 +5,19 @@
 
 **Sharded** is a SQLite-based write buffer and caching system for Prisma that provides high-performance data operations with automatic synchronization to your main database.
 
+## ✨ **NEW: Automatic WAL Optimizations**
+
+🎉 **Zero configuration required!** Sharded now automatically handles all SQLite WAL optimizations:
+
+- **🔒 Prevents "phantom data" issues** - All processes use absolute paths automatically
+- **⚡ Perfect SQLite settings** - Optimal PRAGMA configuration applied automatically  
+- **🔄 Auto WAL maintenance** - Checkpointing and cleanup every 30 seconds
+- **🏥 Health monitoring** - Auto-detection and recovery from WAL issues
+- **⏱️ Smart transactions** - Short-lived reads prevent blocking
+- **🛡️ Graceful fallbacks** - Automatic error recovery
+
+Just use `Block.create()` normally - all optimizations work behind the scenes!
+
 ## 🚀 Performance Benefits
 
 - **Dramatic Speed Improvement**: Reduce write & read times from >100ms to <10ms
@@ -21,7 +34,7 @@
 - **Prisma Integration**: Seamless integration with existing Prisma workflows
 - **Multi-Node Support**: Master/worker architecture for distributed systems
 - **Schema Generation**: CLI tools to generate optimized schemas for your blocks
-- **WAL Mode**: Optimized SQLite configuration for concurrent access
+- **WAL Mode**: Automatic WAL optimizations prevent "phantom data" issues ([details](./WAL-OPTIMIZATIONS.md))
 
 ## 🎯 When to Use Sharded
 
