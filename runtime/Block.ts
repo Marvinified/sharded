@@ -2512,7 +2512,7 @@ export class Block {
             }
 
             // Wait for write operations to complete (reads can continue and will fail gracefully)
-            const maxWaitTime = 5000 // Reduced to 5 seconds since we only wait for writes
+            const maxWaitTime = 600000 // Reduced to 5 seconds since we only wait for writes
             const startTime = Date.now()
             let lastLogTime = 0
             while (Block.activeWriteOperations.has(blockId)) {
