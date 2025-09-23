@@ -2462,63 +2462,37 @@ export class Block {
         return newClient as typeof client & Prisma.DefaultPrismaClient
     }
 
-    static async invalidate(blockId: string) {
-        // Use the same block_lock as master creation/reload for mutual exclusion
-        const blockLockKey = `block_lock:${blockId}`
-        const processId = `${process.pid}_${Date.now()}`
-
-        // Try to acquire block lock with 30 second timeout
-        let lockAcquired = false
-        const maxWaitTime = 30000
-        const startTime = Date.now()
-
-        while (!lockAcquired && (Date.now() - startTime < maxWaitTime)) {
-            const result = await Block.redis?.set(blockLockKey, processId, 'PX', 30000, 'NX')
-            if (result === 'OK') {
-                lockAcquired = true
-                if (Block.debug) {
-                    console.log(`[Sharded] Acquired block lock for invalidation: ${blockId}`)
-                }
-            } else {
-                if (Block.debug) {
-                    console.log(`[Sharded] Block lock exists for ${blockId}, waiting...`)
-                }
-                await new Promise(resolve => setTimeout(resolve, 100))
-            }
+    static async invalidate(blockId: string): Promise<void> {
+        if (Block.debug) {
+            console.log('[Sharded] Starting invalidation of block:', blockId)
         }
 
-        if (!lockAcquired) {
-            if (Block.debug) {
-                console.log(`[Sharded] Failed to acquire block lock for invalidation of ${blockId}`)
-            }
-            return // Another process is using the block
-        }
-
-        // Prevent double invalidation locally as well
+        // Prevent double invalidation locally first
         if (Block.invalidatingBlocks.has(blockId)) {
             if (Block.debug) {
                 console.log('[Sharded] Block already being invalidated locally:', blockId)
             }
-            // Release the Redis lock since we won't proceed
-            await Block.redis?.del(blockLockKey)
             return
         }
 
         Block.invalidatingBlocks.add(blockId)
 
         try {
+            // First, wait for ongoing operations to complete WITHOUT holding any locks
+            // This allows sync operations to finish their work naturally
+            const maxWaitTime = 3600000 // 60 minutes timeout for operations to complete
+            
             if (Block.debug) {
-                console.log('[Sharded] Starting invalidation of block:', blockId)
+                console.log(`[Sharded] Waiting for ongoing operations to complete before acquiring lock for block ${blockId}`)
             }
 
             // Wait for write operations to complete (reads can continue and will fail gracefully)
-            const maxWaitTime = 600000 // Reduced to 5 seconds since we only wait for writes
             const startTime = Date.now()
             let lastLogTime = 0
             while (Block.activeWriteOperations.has(blockId)) {
                 const elapsed = Date.now() - startTime
                 if (elapsed > maxWaitTime) {
-                    console.warn(`[Sharded] Timeout waiting for write operations to complete for block ${blockId}, forcing invalidation`)
+                    console.warn(`[Sharded] Timeout waiting for write operations to complete for block ${blockId}, proceeding with invalidation`)
                     break
                 }
                 // Log every 2 seconds instead of every 100ms to reduce noise
@@ -2531,9 +2505,63 @@ export class Block {
 
             // Wait for pending sync operations to complete
             if (Block.debug) {
-                console.log(`[Sharded] Waiting for pending syncs before invalidating block ${blockId}`)
+                console.log(`[Sharded] Waiting for pending syncs before acquiring lock for block ${blockId}`)
             }
             await Block.waitForPendingSyncs(blockId, maxWaitTime)
+
+            // NOW acquire the block lock after operations have completed
+            const blockLockKey = `block_lock:${blockId}`
+            const processId = `${process.pid}_${Date.now()}`
+            
+            let lockAcquired = false
+            const lockWaitTime = 30000 // 30 seconds for lock acquisition
+            const lockStartTime = Date.now()
+
+            while (!lockAcquired && (Date.now() - lockStartTime < lockWaitTime)) {
+                const result = await Block.redis?.set(blockLockKey, processId, 'PX', 30000, 'NX')
+                if (result === 'OK') {
+                    lockAcquired = true
+                    if (Block.debug) {
+                        console.log(`[Sharded] Acquired block lock for invalidation: ${blockId}`)
+                    }
+                } else {
+                    if (Block.debug) {
+                        console.log(`[Sharded] Block lock exists for ${blockId}, waiting...`)
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                }
+            }
+
+            if (!lockAcquired) {
+                if (Block.debug) {
+                    console.log(`[Sharded] Failed to acquire block lock for invalidation of ${blockId}`)
+                }
+                return // Another process is using the block
+            }
+
+            // Final check for any new operations that might have started while waiting for lock
+            // This ensures we don't invalidate while new operations are in progress
+            if (Block.activeWriteOperations.has(blockId)) {
+                if (Block.debug) {
+                    console.log(`[Sharded] New write operations detected for ${blockId}, releasing lock and retrying`)
+                }
+                await Block.redis?.del(blockLockKey)
+                Block.invalidatingBlocks.delete(blockId)
+                // Retry invalidation
+                return Block.invalidate(blockId)
+            }
+
+            // Double-check pending syncs
+            const pendingCount = await Block.redis?.llen(`block_operations:${blockId}`) || 0
+            if (pendingCount > 0) {
+                if (Block.debug) {
+                    console.log(`[Sharded] New sync operations detected for ${blockId} (${pendingCount} pending), releasing lock and retrying`)
+                }
+                await Block.redis?.del(blockLockKey)
+                Block.invalidatingBlocks.delete(blockId)
+                // Retry invalidation
+                return Block.invalidate(blockId)
+            }
 
             // Clean up Redis operation queue
             const operationQueueKey = `block_operations:${blockId}`
@@ -2583,11 +2611,17 @@ export class Block {
         } finally {
             Block.invalidatingBlocks.delete(blockId)
 
-            // Always release the Redis block lock
+            // Only release the Redis block lock if we might have acquired it
+            // (This handles cases where we fail before acquiring the lock)
             const blockLockKey = `block_lock:${blockId}`
-            await Block.redis?.del(blockLockKey)
-            if (Block.debug) {
-                console.log(`[Sharded] Released block lock after invalidation: ${blockId}`)
+            const lockValue = await Block.redis?.get(blockLockKey)
+            if (lockValue && lockValue.startsWith(`${process.pid}_`)) {
+                await Block.redis?.del(blockLockKey)
+                if (Block.debug) {
+                    console.log(`[Sharded] Released block lock after invalidation: ${blockId}`)
+                }
+            } else if (Block.debug && lockValue) {
+                console.log(`[Sharded] Block lock for ${blockId} owned by different process, not releasing`)
             }
         }
     }
