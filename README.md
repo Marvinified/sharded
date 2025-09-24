@@ -298,17 +298,54 @@ await Block.delete_block("user-orders-cache");
 
 ### Block.watch(options)
 
-Start watching for cache invalidation (master nodes):
+Start watching for cache invalidation and orphaned queue recovery (master nodes):
 
 ```typescript
 await Block.watch({
   ttl: 3600,
   interval: 60000, // Check every minute
+  orphanedQueueCheckInterval: 30000, // Check for orphaned queues every 30 seconds
+  mainClient: prismaClient, // Required for orphaned queue recovery
   connection: {
     host: "localhost",
     port: 6379,
   },
 });
+```
+
+**Important**: The `mainClient` parameter is crucial for orphaned queue recovery. When a process restarts, the in-memory `Block.mainClients` map is empty, but Redis still contains queued operations. The provided `mainClient` enables recovery of these orphaned operations.
+
+### Block.getOrphanedQueues()
+
+Get information about blocks with queued operations but no active workers:
+
+```typescript
+const orphanedQueues = await Block.getOrphanedQueues();
+console.log(orphanedQueues);
+// Output: [{ blockId: "user-cache", queueLength: 5, hasWorker: false, hasQueue: true }]
+```
+
+### Block.checkOrphanedQueues(connection?, mainClient?)
+
+Manually check for and restart workers for orphaned queues:
+
+```typescript
+// Basic usage (uses existing mainClients if available)
+await Block.checkOrphanedQueues();
+
+// With main client for orphaned recovery
+await Block.checkOrphanedQueues(undefined, prismaClient);
+```
+
+### Block.createEphemeralRecoveryWorker(blockId, mainClient, connection?)
+
+Manually create an ephemeral recovery worker for a specific block (automatically called by `checkOrphanedQueues`):
+
+```typescript
+const mainClient = Block.mainClients.get("user-cache");
+await Block.createEphemeralRecoveryWorker("user-cache", mainClient);
+// Creates actual BullMQ worker that reuses batch_sync_operation logic
+// Processes all operations until queue is empty, then automatically closes itself
 ```
 
 ## ⚠️ Known Limitations

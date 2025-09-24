@@ -58,9 +58,19 @@ export type BlockConfig<T> = {
     )
 
 
-interface WatchOptions {
+interface WatchOptions<T> {
     ttl?: number
     interval?: number
+    /**
+     * Interval in milliseconds to check for orphaned queues (blocks with items but no workers)
+     * Default: 30000 (30 seconds)
+     */
+    orphanedQueueCheckInterval?: number
+    /**
+     * Main Prisma client to use for orphaned queue recovery
+     * Required for processing orphaned operations when Block.mainClients is empty
+     */
+    mainClient: T
     connection?: ConnectionOptions
 }
 
@@ -79,8 +89,6 @@ export class Block {
     private static locks = new Map<string, Promise<void>>()
     private static redis: Redis | null = null
     private static debug = false
-    // Reference counting for active operations (writes only - reads don't block reloads)
-    private static activeOperations = new Map<string, number>()
     // Track active write operations separately (these DO block reloads)
     private static activeWriteOperations = new Map<string, number>()
     // Track blocks currently being invalidated
@@ -94,6 +102,10 @@ export class Block {
     // Cache lock status to avoid excessive Redis checks
     private static lockStatusCache = new Map<string, { isLocked: boolean, lastChecked: number }>()
     private static LOCK_CACHE_TTL = 500 // 1 second cache for lock status
+    // Track ongoing recovery workers to prevent duplicates
+    private static ongoingRecoveryWorkers = new Set<string>()
+    // Recovery main clients (separate from normal main clients to avoid conflicts)
+    private static recoveryMainClients = new Map<string, Prisma.DefaultPrismaClient>()
     // Batch processing limits
     private static MAX_BATCH_SIZE = 500 // Increased significantly for better throughput
     private static MIN_BATCH_SIZE = 50 // Minimum batch size
@@ -1777,6 +1789,7 @@ export class Block {
     ) {
         const { blockId } = job.data
         const startTime = Date.now()
+
         let timings = {
             total: 0,
             redis_fetch: 0,
@@ -1790,7 +1803,12 @@ export class Block {
         }
 
         try {
-            const mainClient = Block.mainClients.get(blockId)
+            // Check recovery clients first, then normal main clients
+            let mainClient = Block.recoveryMainClients.get(blockId)
+            if (!mainClient) {
+                mainClient = Block.mainClients.get(blockId)
+            }
+
             if (!mainClient) {
                 if (Block.debug) {
                     console.log(`[Sharded] Main client for block ${blockId} not found - block may have been invalidated`)
@@ -1825,12 +1843,12 @@ export class Block {
                 return // No operations to process
             }
 
-            console.log('🔄 Batch sync operation started')
             const operations = results[0][1] as string[]
             if (operations.length === 0) {
                 return
             }
-
+            
+            console.log('🔄 Batch sync operation started')
             timings.operations_count = operations.length
 
             if (Block.debug) {
@@ -2296,6 +2314,55 @@ export class Block {
         console.log('[Sharded] Triggered immediate batch processing for all blocks')
     }
 
+
+    /**
+     * Get orphaned queue information (blocks with items but no workers)
+     */
+    static async getOrphanedQueues(): Promise<Array<{ blockId: string, queueLength: number, hasWorker: boolean, hasQueue: boolean }>> {
+        // Initialize Redis connection if not already done
+        if (!Block.redis) {
+            Block.redis = new Redis({
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                enableOfflineQueue: false,
+            })
+        }
+
+        const orphanedQueues: Array<{ blockId: string, queueLength: number, hasWorker: boolean, hasQueue: boolean }> = []
+
+        try {
+            const operationKeys = await Block.redis.keys('block_operations:*')
+
+            for (const key of operationKeys) {
+                const blockId = key.replace('block_operations:', '')
+                const queueLength = await Block.redis.llen(key)
+
+                if (queueLength > 0) {
+                    const hasWorker = Block.blockWorkers.has(blockId)
+                    const hasQueue = Block.blockQueues.has(blockId)
+
+                    if (!hasWorker || !hasQueue) {
+                        orphanedQueues.push({
+                            blockId,
+                            queueLength,
+                            hasWorker,
+                            hasQueue
+                        })
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('[Sharded] Error getting orphaned queues:', error)
+            throw error
+        }
+
+        return orphanedQueues
+    }
+
     /**
      * Get diagnostic information about the sync workers and queues
      */
@@ -2345,6 +2412,17 @@ export class Block {
                 }
             }
         }
+
+        // Add orphaned queue information
+        try {
+            diagnostics.orphaned_queues = await Block.getOrphanedQueues()
+        } catch (err) {
+            diagnostics.orphaned_queues_error = err instanceof Error ? err.message : String(err)
+        }
+
+        // Add recovery worker information
+        diagnostics.ongoing_recovery_workers = Array.from(Block.ongoingRecoveryWorkers)
+        diagnostics.recovery_client_count = Block.recoveryMainClients.size
 
         return diagnostics
     }
@@ -2946,20 +3024,213 @@ export class Block {
     }
 
     /**
+     * Check for orphaned queues (blocks with operations but no active workers)
+     * and create ephemeral recovery workers that process all operations until done
+     */
+    static async checkOrphanedQueues<T>(mainClient: T | Prisma.DefaultPrismaClient, connection?: ConnectionOptions): Promise<void> {
+        // Initialize Redis connection if not already done
+        if (!Block.redis) {
+            Block.redis = new Redis({
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                enableOfflineQueue: false,
+            })
+        }
+
+        try {
+            // Get all operation queue keys
+            const operationKeys = await Block.redis.keys('block_operations:*')
+
+            for (const key of operationKeys) {
+                const blockId = key.replace('block_operations:', '')
+
+                // Check if the queue has items
+                const queueLength = await Block.redis.llen(key)
+                if (queueLength === 0) {
+                    continue // No items in queue
+                }
+
+                // Check if we have an active worker for this block
+                const hasWorker = Block.blockWorkers.has(blockId)
+                const hasQueue = Block.blockQueues.has(blockId)
+
+                if (!hasWorker || !hasQueue) {
+                    // Check if recovery is already ongoing for this block
+                    if (Block.ongoingRecoveryWorkers.has(blockId)) {
+                        if (Block.debug) {
+                            console.log(`[Sharded] Recovery already ongoing for block ${blockId}, skipping`)
+                        }
+                        continue
+                    }
+
+                    console.log(`[Sharded] Found orphaned queue for block ${blockId} with ${queueLength} items, creating ephemeral recovery worker`)
+
+                    try {
+                        if (!mainClient) {
+                            console.warn(`[Sharded] Cannot create recovery worker for block ${blockId}: no main client provided`)
+                            continue
+                        }
+
+                        // Create ephemeral recovery worker that processes until queue is empty
+                        await Block.createEphemeralRecoveryWorker(blockId, mainClient, connection)
+
+                    } catch (restartError) {
+                        console.error(`[Sharded] Failed to create recovery worker for orphaned queue ${blockId}:`, restartError)
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('[Sharded] Error checking orphaned queues:', error)
+        }
+    }
+
+    /**
+     * Create an ephemeral recovery worker that processes all operations until the queue is empty
+     * and then automatically closes itself
+     */
+    static async createEphemeralRecoveryWorker(
+        blockId: string,
+        mainClient: any,
+        connection?: ConnectionOptions
+    ): Promise<void> {
+        // Initialize Redis connection if not already done
+        if (!Block.redis) {
+            Block.redis = new Redis({
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                enableOfflineQueue: false,
+            })
+        }
+
+        // Mark recovery as ongoing
+        Block.ongoingRecoveryWorkers.add(blockId)
+        console.log(`[Sharded] Creating ephemeral recovery worker for block ${blockId}`)
+
+        // Add the provided client to recovery clients map so batch_sync_operation can find it
+        Block.recoveryMainClients.set(blockId, mainClient)
+
+        // Create a unique queue name for this recovery worker
+        const recoveryQueueName = `${blockId}_recovery_${Date.now()}`
+
+        // Create the recovery queue
+        const recoveryQueue = new Queue(recoveryQueueName, {
+            connection: connection ?? {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                maxRetriesPerRequest: null,
+                enableOfflineQueue: true,
+            },
+        })
+
+        // Create worker that reuses batch_sync_operation and processes until empty
+        const recoveryWorker = new Worker(recoveryQueueName, async (job: Job<{ blockId: string }>) => {
+            const startTime = Date.now()
+            let totalBatches = 0
+
+            try {
+                console.log(`[Sharded] Starting ephemeral recovery processing for block ${blockId}`)
+
+                // Keep processing until the queue is empty
+                while (true) {
+                    // Check if there are any operations left
+                    const operationQueueKey = `block_operations:${blockId}`
+                    const queueLength = await Block.redis!.llen(operationQueueKey)
+
+                    if (queueLength === 0) {
+                        console.log(`[Sharded] Ephemeral recovery completed for block ${blockId}. Processed ${totalBatches} batches in ${Date.now() - startTime}ms`)
+                        break
+                    }
+
+                    // Reuse the existing batch_sync_operation logic
+                    await Block.batch_sync_operation(job)
+                    totalBatches++
+
+                    if (Block.debug) {
+                        console.log(`[Sharded] Ephemeral recovery batch ${totalBatches} completed for ${blockId}`)
+                    }
+                }
+
+            } catch (error) {
+                console.error(`[Sharded] Error in ephemeral recovery worker for ${blockId}:`, error)
+                throw error // Re-throw to mark job as failed
+            } finally {
+                // Clean up regardless of success or failure
+                setTimeout(async () => {
+                    try {
+                        // Mark recovery as complete
+                        Block.ongoingRecoveryWorkers.delete(blockId)
+
+                        // Remove from recovery clients map
+                        Block.recoveryMainClients.delete(blockId)
+
+                        // Close worker and queue
+                        await recoveryWorker.close()
+                        await recoveryQueue.close()
+
+                        console.log(`[Sharded] Ephemeral recovery worker cleaned up for block ${blockId}`)
+                    } catch (cleanupError) {
+                        console.error(`[Sharded] Error during cleanup for ${blockId}:`, cleanupError)
+                    }
+                }, 100) // Small delay to ensure job completes before cleanup
+            }
+        }, {
+            concurrency: 1,
+            connection: connection ?? {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                maxRetriesPerRequest: null,
+                enableOfflineQueue: true,
+            },
+        })
+
+        recoveryWorker.on("error", (error) => {
+            console.error(`[Sharded] Error in ephemeral recovery worker for ${blockId}:`, error);
+        });
+
+        await recoveryWorker.waitUntilReady()
+
+        // Add a single job to start the recovery process
+        await recoveryQueue.add(`${blockId}_recovery`, { blockId }, {
+            removeOnComplete: true,
+            removeOnFail: false,
+        })
+    }
+
+
+    /**
      * invalidation worker process
      *  - Will watch every block created on this node/machine
      *  - If block hasn't been accessed or written to longer than the ttl, configured on the master node
      *  - It will run this check every 10 seconds (override with interval) on all blocks
+     *  - Also checks for orphaned queues (blocks with items but no workers) every 30 seconds
      * 
      * @param options
      * Watcher options:
      *  - ttl: in seconds, The default ttl for all blocks, if not set on the master node
      *  - interval: in milliseconds, The interval to check all blocks
+     *  - orphanedQueueCheckInterval: in milliseconds, The interval to check for orphaned queues
+     *  - mainClient: Main Prisma client for orphaned queue recovery (important after restarts)
      *  - connection: The connection options for the queue
      *  */
 
-    static async watch(options: WatchOptions) {
-        const queue = new Queue('invalidation', {
+    static async watch<T>(options: WatchOptions<T>) {
+        const invalidationQueue = new Queue('invalidation', {
             connection: options.connection ?? {
                 host: process.env.REDIS_HOST ?? 'localhost',
                 port: process.env.REDIS_PORT
@@ -2973,13 +3244,32 @@ export class Block {
             },
         })
 
-        queue.on("error", (error) => {
-            console.error(`[sharded][watch] Unhandled error block invalidation queue: ${queue.name}`, error);
+        const orphanedQueue = new Queue('orphaned', {
+            connection: options.connection ?? {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT
+                    ? parseInt(process.env.REDIS_PORT)
+                    : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                enableOfflineQueue: false,
+            },
+        })
+
+        invalidationQueue.on("error", (error) => {
+            console.error(`[sharded][watch] Unhandled error block invalidation queue: ${invalidationQueue.name}`, error);
         });
 
-        await queue.waitUntilReady()
+        orphanedQueue.on("error", (error) => {
+            console.error(`[sharded][watch] Unhandled error block orphaned queue: ${orphanedQueue.name}`, error);
+        });
 
-        await queue.upsertJobScheduler("check-invalidation-every", {
+        await invalidationQueue.waitUntilReady()
+        await orphanedQueue.waitUntilReady()
+
+        await invalidationQueue.upsertJobScheduler("check-invalidation-every", {
             every: options.interval ?? 10000,
         }, {
             name: "check-invalidation-every",
@@ -2988,11 +3278,24 @@ export class Block {
             },
         })
 
-        new Worker(queue.name, async (job: Job<{ ttl: number }>) => {
+        // Add scheduler for orphaned queue checks
+        await orphanedQueue.upsertJobScheduler("check-orphaned-queues-every", {
+            every: options.orphanedQueueCheckInterval ?? 30000,
+        }, {
+            name: "check-orphaned-queues-every",
+            data: {},
+        })
+
+
+        new Worker(invalidationQueue.name, async (job: Job<{ ttl?: number }>) => {
+            if (Block.debug) {
+                console.log('[Sharded] checking invalidation')
+            }
+            // Handle TTL-based invalidation
             const lastSeen = await Block.redis?.hgetall("last_seen")
             for (const blockId in lastSeen) {
                 const lastSeenTime = parseInt(lastSeen[blockId])
-                const blockTtl = parseInt((await Block.redis?.hget("block_ttl", blockId)) ?? `${job.data.ttl}`) * 1000
+                const blockTtl = parseInt((await Block.redis?.hget("block_ttl", blockId)) ?? `${job.data.ttl ?? 60}`) * 1000
                 if (Date.now() - lastSeenTime > blockTtl) {
                     // Check if block has active operations, creation, or reload before invalidating
                     if (await Block.canInvalidate(blockId)) {
@@ -3022,6 +3325,21 @@ export class Block {
                 },
                 maxRetriesPerRequest: null,
                 enableOfflineQueue: true,
+            },
+        })
+
+        new Worker(orphanedQueue.name, async (job: Job<{ ttl?: number }>) => {
+            if (Block.debug) {
+                console.log('[Sharded] Checking for orphaned queues')
+            }
+            await Block.checkOrphanedQueues(options.mainClient, options.connection)
+        }, {
+            connection: options.connection ?? {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT
+                    ? parseInt(process.env.REDIS_PORT)
+                    : 6379,
+                password: process.env.REDIS_PASSWORD,
             },
         })
     }
