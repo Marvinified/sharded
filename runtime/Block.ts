@@ -640,8 +640,8 @@ export class Block {
                 }
 
                 // Check #5: Is busy timeout set appropriately?
-                if (diagnostics.busy_timeout < 5000) {
-                    warnings.push(`Low busy timeout: ${diagnostics.busy_timeout}ms`)
+                if (diagnostics.busy_timeout < 10000) {
+                    warnings.push(`Low busy timeout: ${diagnostics.busy_timeout}ms (recommended: 10000ms)`)
                 }
 
                 const status = issues.length > 0 ? 'ERROR' : warnings.length > 0 ? 'WARNING' : 'HEALTHY'
@@ -1124,14 +1124,14 @@ export class Block {
                 // Core WAL configuration
                 await blockClient.$queryRaw`PRAGMA journal_mode=WAL`
                 await blockClient.$queryRaw`PRAGMA synchronous=FULL` // Use FULL for durability (safer than NORMAL)
-                await blockClient.$queryRaw`PRAGMA busy_timeout=5000`
+                await blockClient.$queryRaw`PRAGMA busy_timeout=10000` // Increased from 5000 to 10000 (10 seconds)
 
                 // Memory and performance settings
                 await blockClient.$queryRaw`PRAGMA cache_size=-4000` // Use 4MB of memory for cache
                 await blockClient.$queryRaw`PRAGMA temp_store=MEMORY` // Keep temp tables in memory
 
                 // WAL-specific settings for better concurrency and reliability
-                await blockClient.$queryRaw`PRAGMA wal_autocheckpoint=2000` // More conservative checkpointing
+                await blockClient.$queryRaw`PRAGMA wal_autocheckpoint=1000` // More aggressive checkpointing (was 2000)
 
                 // Skip mmap for better container/filesystem compatibility
                 await blockClient.$queryRaw`PRAGMA mmap_size=0`
@@ -1847,8 +1847,10 @@ export class Block {
             if (operations.length === 0) {
                 return
             }
-            
-            console.log('🔄 Batch sync operation started')
+
+            if (Block.debug) {
+                console.log('🔄 Batch sync operation started')
+            }
             timings.operations_count = operations.length
 
             if (Block.debug) {
@@ -1925,8 +1927,8 @@ export class Block {
                         await mainClient.$transaction(async (tx) => {
                             await (tx as any)[model][operation](args)
                         }, {
-                            timeout: 15000, // Increased for individual operations
-                            maxWait: 5000,  // Reasonable maxWait for individual ops
+                            timeout: 20000, // Conservative timeout for individual operations
+                            maxWait: 8000,  // Conservative maxWait for individual ops
                         })
 
                         // Operation succeeded individually
@@ -2664,8 +2666,8 @@ export class Block {
                             result = await currentBlockClient.$transaction(async (tx: any) => {
                                 return await (tx as any)[model.toLowerCase()][operation](args)
                             }, {
-                                timeout: 5000, // Short timeout for read operations to prevent long snapshots
-                                maxWait: 1000   // Don't wait long to start
+                                timeout: 10000, // Conservative timeout for read operations
+                                maxWait: 3000   // Conservative maxWait
                             })
                         } catch (txErr: any) {
                             // If transaction fails, fallback to direct query (still better than failure)
@@ -2687,8 +2689,8 @@ export class Block {
                                 const mainResult = await mainClient.$transaction(async (tx) => {
                                     return await (tx as any)[model.toLowerCase()][operation](args)
                                 }, {
-                                    timeout: 5000,
-                                    maxWait: 1000
+                                    timeout: 10000, // Conservative timeout for main client fallback
+                                    maxWait: 3000   // Conservative maxWait
                                 })
 
                                 if (mainResult) {
@@ -2701,8 +2703,8 @@ export class Block {
                                     result = await currentBlockClient.$transaction(async (tx: any) => {
                                         return await (tx as any)[model.toLowerCase()][operation](args)
                                     }, {
-                                        timeout: 5000,
-                                        maxWait: 1000
+                                        timeout: 10000, // Conservative timeout for block reload
+                                        maxWait: 3000   // Conservative maxWait
                                     })
                                 }
                             } catch (mainErr) {

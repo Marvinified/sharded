@@ -64,7 +64,7 @@ url: `file:${absoluteBlockPath}?mode=rwc&cache=private`
 ```sql
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;           -- Full durability (safer than NORMAL)
-PRAGMA busy_timeout=5000;          -- 5 second timeout for lock contention
+PRAGMA busy_timeout=10000;         -- 10 second timeout for lock contention (increased for reliability)
 PRAGMA cache_size=-4000;           -- 4MB memory cache
 PRAGMA temp_store=MEMORY;          -- Temp tables in memory
 PRAGMA wal_autocheckpoint=2000;    -- Conservative auto-checkpoint
@@ -82,8 +82,8 @@ PRAGMA secure_delete=ON;           -- Secure deletion
 let result = await blockClient.$transaction(async (tx: any) => {
     return await tx[model][operation](args)
 }, {
-    timeout: 5000,  // Prevent long snapshots
-    maxWait: 1000   // Don't wait long to start
+    timeout: 10000, // Conservative timeout to prevent errors under load
+    maxWait: 3000   // Conservative maxWait for reliability
 })
 ```
 
