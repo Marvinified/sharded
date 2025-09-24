@@ -9,7 +9,7 @@
     "prepublishOnly": "yarn build",
     "generate": "ts-node cli/generate.ts",
     "test": "ts-node test.ts",
-    "dev": "tsc --watch --incremental"
+    "dev": "tsc --watch"
   },
   "dependencies": {
     "@prisma/client": "^6.7.0",

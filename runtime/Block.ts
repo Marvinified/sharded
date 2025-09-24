@@ -71,6 +71,9 @@ export class Block {
     >()
     public static blockClients = new Map<string, Prisma.DefaultPrismaClient>()
     private static mainClients = new Map<string, Prisma.DefaultPrismaClient>()
+
+    // Global error handlers setup flag
+    private static globalHandlersSetup = false
     private static blockQueues = new Map<string, Queue>()
     private static blockWorkers = new Map<string, Worker>()
     private static locks = new Map<string, Promise<void>>()
@@ -92,13 +95,17 @@ export class Block {
     private static lockStatusCache = new Map<string, { isLocked: boolean, lastChecked: number }>()
     private static LOCK_CACHE_TTL = 500 // 1 second cache for lock status
     // Batch processing limits
-    private static MAX_BATCH_SIZE = 100 // Increased significantly for better throughput
-    private static MIN_BATCH_SIZE = 5 // Minimum batch size
+    private static MAX_BATCH_SIZE = 500 // Increased significantly for better throughput
+    private static MIN_BATCH_SIZE = 50 // Minimum batch size
     private static TRANSACTION_TIMEOUT = 30000 // 30 seconds transaction timeout
     private static ADAPTIVE_BATCH_SIZE = true // Enable adaptive batch sizing based on performance
     // Adaptive batch sizing tracking
     private static batchPerformanceHistory = new Map<string, { size: number, duration: number, success: boolean }[]>()
-    private static PERFORMANCE_HISTORY_SIZE = 10 // Keep last 10 batch performance records
+    private static PERFORMANCE_HISTORY_SIZE = 20 // Keep last 20 batch performance records
+    private static batchSizeLastExplored = new Map<string, number>() // Track last exploration time
+    private static EXPLORATION_INTERVAL = 15000 // Explore new batch sizes every 15 seconds
+    private static batchSizeLastLogged = new Map<string, number>() // Track last log time
+    private static LOG_INTERVAL = 10000 // Log optimal batch size every 10 seconds max
     // Error handling
     private static MAX_OPERATION_RETRIES = 3 // Maximum retries for failed operations
     private static FAILED_OPERATIONS_KEY_PREFIX = 'failed_operations' // Redis key prefix for failed operations
@@ -132,6 +139,68 @@ export class Block {
                 maintenance: Block.walMaintenanceEnabled,
                 autoRecovery: Block.autoRecoveryEnabled
             })
+        }
+    }
+
+    /**
+     * Setup global process handlers for unhandled rejections and exceptions
+     */
+    private static setupGlobalErrorHandlers(): void {
+        if (Block.globalHandlersSetup) {
+            return
+        }
+
+        // Handle unhandled promise rejections
+        process.on('unhandledRejection', (reason, promise) => {
+            console.error('[Sharded] Unhandled Promise Rejection at:', promise)
+            console.error('[Sharded] Reason:', reason)
+
+            if (Block.debug) {
+                console.error('[Sharded] Stack trace:', reason instanceof Error ? reason.stack : 'No stack trace available')
+            }
+
+            // Don't exit the process, just log the error
+            // In production, you might want to implement more sophisticated error reporting
+        })
+
+        // Handle uncaught exceptions
+        process.on('uncaughtException', (error) => {
+            console.error('[Sharded] Uncaught Exception:', error)
+
+            if (Block.debug) {
+                console.error('[Sharded] Stack trace:', error.stack)
+            }
+
+            // For uncaught exceptions, we typically want to exit gracefully
+            console.error('[Sharded] Process will exit due to uncaught exception')
+            process.exit(1)
+        })
+
+        // Handle process termination gracefully
+        process.on('SIGTERM', () => {
+            console.log('[Sharded] SIGTERM received, shutting down gracefully...')
+            Block.gracefulShutdown(5000).then(() => {
+                process.exit(0)
+            }).catch(err => {
+                console.error('[Sharded] Error during graceful shutdown:', err)
+                process.exit(1)
+            })
+        })
+
+        process.on('SIGINT', () => {
+            console.log('[Sharded] SIGINT received, shutting down gracefully...')
+            Block.gracefulShutdown(5000).then(() => {
+                process.exit(0)
+            }).catch(err => {
+                console.error('[Sharded] Error during graceful shutdown:', err)
+                process.exit(1)
+            })
+        })
+
+        Block.globalHandlersSetup = true
+
+        if (Block.debug) {
+            console.log('[Sharded] Global error handlers setup completed')
         }
     }
 
@@ -280,37 +349,42 @@ export class Block {
             clearInterval(Block.walMaintenanceInterval)
         }
 
-        Block.walMaintenanceInterval = setInterval(async () => {
-            try {
-                const blockIds = Array.from(Block.blockClients.keys())
+        Block.walMaintenanceInterval = setInterval(() => {
+            // Wrap async operations to properly handle unhandled rejections
+            (async () => {
+                try {
+                    const blockIds = Array.from(Block.blockClients.keys())
 
-                for (const blockId of blockIds) {
-                    try {
-                        // Perform passive checkpoint to avoid blocking operations
-                        const result = await Block.forceWalCheckpoint(blockId, 'PASSIVE')
+                    for (const blockId of blockIds) {
+                        try {
+                            // Perform passive checkpoint to avoid blocking operations
+                            const result = await Block.forceWalCheckpoint(blockId, 'PASSIVE')
 
-                        if (result.result.busy > 0) {
-                            if (Block.debug) {
-                                console.log(`[Sharded] WAL checkpoint busy for ${blockId}, readers may be holding old snapshots`)
+                            if (result.result.busy > 0) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] WAL checkpoint busy for ${blockId}, readers may be holding old snapshots`)
+                                }
                             }
-                        }
 
-                        // If checkpoint shows significant WAL size, try a more aggressive checkpoint
-                        if (result.result.log > 10000) { // More than 10k pages
-                            if (Block.debug) {
-                                console.log(`[Sharded] Large WAL detected for ${blockId} (${result.result.log} pages), attempting FULL checkpoint`)
+                            // If checkpoint shows significant WAL size, try a more aggressive checkpoint
+                            if (result.result.log > 10000) { // More than 10k pages
+                                if (Block.debug) {
+                                    console.log(`[Sharded] Large WAL detected for ${blockId} (${result.result.log} pages), attempting FULL checkpoint`)
+                                }
+                                await Block.forceWalCheckpoint(blockId, 'FULL')
                             }
-                            await Block.forceWalCheckpoint(blockId, 'FULL')
-                        }
 
-                    } catch (err) {
-                        console.error(`[Sharded] WAL maintenance failed for ${blockId}:`, err)
-                        // Continue with other blocks
+                        } catch (err) {
+                            console.error(`[Sharded] WAL maintenance failed for ${blockId}:`, err)
+                            // Continue with other blocks
+                        }
                     }
+                } catch (err) {
+                    console.error('[Sharded] WAL maintenance error:', err)
                 }
-            } catch (err) {
-                console.error('[Sharded] WAL maintenance error:', err)
-            }
+            })().catch(err => {
+                console.error('[Sharded] Unhandled error in WAL maintenance interval:', err)
+            })
         }, intervalMs)
 
         if (Block.debug) {
@@ -347,56 +421,61 @@ export class Block {
             return
         }
 
-        Block.walHealthCheckInterval = setInterval(async () => {
-            try {
-                const healthStatus = await Block.getWalHealthStatus()
+        Block.walHealthCheckInterval = setInterval(() => {
+            // Wrap async operations to properly handle unhandled rejections
+            (async () => {
+                try {
+                    const healthStatus = await Block.getWalHealthStatus()
 
-                // Auto-recovery for common issues
-                for (const [blockId, blockData] of Object.entries(healthStatus.blocks)) {
-                    const data = blockData as any
+                    // Auto-recovery for common issues
+                    for (const [blockId, blockData] of Object.entries(healthStatus.blocks)) {
+                        const data = blockData as any
 
-                    // Handle busy readers automatically
-                    if (data.warnings?.some((w: string) => w.includes('Busy readers'))) {
-                        if (Block.debug) {
-                            console.log(`[Sharded] Auto-recovery: Clearing busy readers for block ${blockId}`)
-                        }
-                        try {
-                            await Block.forceWalCheckpoint(blockId, 'FULL')
-                        } catch (err) {
+                        // Handle busy readers automatically
+                        if (data.warnings?.some((w: string) => w.includes('Busy readers'))) {
                             if (Block.debug) {
-                                console.log(`[Sharded] Auto-recovery checkpoint failed for ${blockId}:`, err)
+                                console.log(`[Sharded] Auto-recovery: Clearing busy readers for block ${blockId}`)
+                            }
+                            try {
+                                await Block.forceWalCheckpoint(blockId, 'FULL')
+                            } catch (err) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] Auto-recovery checkpoint failed for ${blockId}:`, err)
+                                }
+                            }
+                        }
+
+                        // Handle large WAL files automatically
+                        if (data.warnings?.some((w: string) => w.includes('Large WAL file'))) {
+                            if (Block.debug) {
+                                console.log(`[Sharded] Auto-recovery: Truncating large WAL for block ${blockId}`)
+                            }
+                            try {
+                                await Block.forceWalCheckpoint(blockId, 'RESTART')
+                            } catch (err) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] Auto-recovery WAL restart failed for ${blockId}:`, err)
+                                }
                             }
                         }
                     }
 
-                    // Handle large WAL files automatically
-                    if (data.warnings?.some((w: string) => w.includes('Large WAL file'))) {
+                    // Log health summary if there are issues
+                    if (healthStatus.warning_blocks > 0 || healthStatus.error_blocks > 0) {
                         if (Block.debug) {
-                            console.log(`[Sharded] Auto-recovery: Truncating large WAL for block ${blockId}`)
-                        }
-                        try {
-                            await Block.forceWalCheckpoint(blockId, 'RESTART')
-                        } catch (err) {
-                            if (Block.debug) {
-                                console.log(`[Sharded] Auto-recovery WAL restart failed for ${blockId}:`, err)
-                            }
+                            console.log(`[Sharded] WAL Health: ${healthStatus.healthy_blocks} healthy, ${healthStatus.warning_blocks} warnings, ${healthStatus.error_blocks} errors`)
                         }
                     }
-                }
 
-                // Log health summary if there are issues
-                if (healthStatus.warning_blocks > 0 || healthStatus.error_blocks > 0) {
+                } catch (err) {
+                    // Don't let health monitoring errors break the system
                     if (Block.debug) {
-                        console.log(`[Sharded] WAL Health: ${healthStatus.healthy_blocks} healthy, ${healthStatus.warning_blocks} warnings, ${healthStatus.error_blocks} errors`)
+                        console.log('[Sharded] WAL health monitoring error:', err)
                     }
                 }
-
-            } catch (err) {
-                // Don't let health monitoring errors break the system
-                if (Block.debug) {
-                    console.log('[Sharded] WAL health monitoring error:', err)
-                }
-            }
+            })().catch(err => {
+                console.error('[Sharded] Unhandled error in WAL health monitoring interval:', err)
+            })
         }, 60000) // Check every minute
 
         if (Block.debug) {
@@ -596,49 +675,193 @@ export class Block {
             return Block.MAX_BATCH_SIZE
         }
 
+        const now = Date.now()
         const history = Block.batchPerformanceHistory.get(blockId) || []
-        if (history.length < 2) {
-            return Math.max(Block.MIN_BATCH_SIZE, Math.floor(Block.MAX_BATCH_SIZE / 4)) // Start at 25% of max
+
+        // Start with a conservative initial size and scale up systematically
+        if (history.length < 3) {
+            return 50 // Start at 50 operations as requested
         }
 
-        // Calculate success rate and average duration for different batch sizes
+        // Calculate success rate and performance metrics for different batch sizes
         const recentHistory = history.slice(-Block.PERFORMANCE_HISTORY_SIZE)
         const successfulBatches = recentHistory.filter(h => h.success)
+        const recentFailures = recentHistory.filter(h => !h.success)
 
         if (successfulBatches.length === 0) {
             return Block.MIN_BATCH_SIZE // Fall back to minimum if all recent batches failed
         }
 
-        // Find the largest successful batch size with good performance
-        let optimalSize = Block.MIN_BATCH_SIZE
-        const performanceThreshold = Block.TRANSACTION_TIMEOUT * 0.8 // Use 80% of timeout as threshold
+        // Check for recent timeout-related failures and be more conservative
+        const recentTimeoutFailures = recentFailures.filter(h => h.duration >= Block.TRANSACTION_TIMEOUT * 0.9)
+        const hasRecentTimeouts = recentTimeoutFailures.length > 0
+
+        // Group successful batches by size to understand performance per size
+        const sizePerformance = new Map<number, { count: number, avgDuration: number }>()
 
         for (const record of successfulBatches) {
-            if (record.duration < performanceThreshold) {
-                optimalSize = Math.max(optimalSize, record.size)
+            const existing = sizePerformance.get(record.size)
+            if (existing) {
+                existing.count++
+                existing.avgDuration = (existing.avgDuration * (existing.count - 1) + record.duration) / existing.count
+            } else {
+                sizePerformance.set(record.size, { count: 1, avgDuration: record.duration })
             }
         }
 
-        // More aggressive scaling based on recent performance
-        const recentSuccessRate = successfulBatches.length / recentHistory.length
-        const avgDuration = successfulBatches.reduce((sum, b) => sum + b.duration, 0) / successfulBatches.length
+        // Find the optimal size based on throughput (operations per second)
+        // Apply penalties for very small batches to avoid bias toward overhead-light operations
+        let bestEfficiency = 0
+        let optimalSize = Block.MIN_BATCH_SIZE
+        const performanceThreshold = Block.TRANSACTION_TIMEOUT * 0.6 // Use 60% of timeout as threshold
 
-        if (recentSuccessRate >= 0.9 && avgDuration < performanceThreshold * 0.5) {
-            // Excellent performance - scale up aggressively
-            optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize * 1.5)
-        } else if (recentSuccessRate >= 0.8 && avgDuration < performanceThreshold * 0.7) {
-            // Good performance - moderate scaling
-            optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize + 10)
-        } else if (recentSuccessRate >= 0.6) {
-            // Decent performance - small scaling
-            optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize + 5)
-        } else {
-            // Poor performance - scale down
-            optimalSize = Math.max(Block.MIN_BATCH_SIZE, Math.floor(optimalSize * 0.7))
+        for (const [size, perf] of sizePerformance) {
+            if (perf.avgDuration < performanceThreshold) {
+                const throughput = size / (perf.avgDuration / 1000) // operations per second
+
+                // Apply a size-based efficiency multiplier to favor larger batches
+                // Small batches get penalized because they don't amortize overhead well
+                let sizeMultiplier = 1.0
+                if (size <= 3) {
+                    sizeMultiplier = 0.6 // Heavily penalize very small batches
+                } else if (size <= 8) {
+                    sizeMultiplier = 0.8 // Moderately penalize small batches
+                } else if (size >= 15) {
+                    sizeMultiplier = 1.2 // Favor larger batches
+                }
+
+                // Also consider sample size - prefer sizes with more data points
+                const sampleWeight = Math.min(1.0, perf.count / 3) // Full weight after 3+ samples
+
+                const efficiency = throughput * sizeMultiplier * sampleWeight
+
+                if (efficiency > bestEfficiency) {
+                    bestEfficiency = efficiency
+                    optimalSize = size
+                }
+            }
         }
 
-        if (Block.debug) {
-            console.log(`[Sharded] Optimal batch size for ${blockId}: ${optimalSize} (success rate: ${recentSuccessRate.toFixed(2)})`)
+        // Check if we should explore a larger batch size
+        const lastExplored = Block.batchSizeLastExplored.get(blockId) || 0
+        const shouldExplore = (now - lastExplored) > Block.EXPLORATION_INTERVAL
+
+        const recentSuccessRate = successfulBatches.length / recentHistory.length
+        const maxTestedSize = Math.max(...successfulBatches.map(b => b.size))
+
+        // Aggressive exploration logic: systematically push toward performance ceiling
+        // But be much more conservative if we've had recent timeouts
+        if (shouldExplore && recentSuccessRate >= 0.7 && maxTestedSize < Block.MAX_BATCH_SIZE && !hasRecentTimeouts) {
+            let explorationSize: number
+
+            // More aggressive scaling based on current performance
+            if (recentSuccessRate >= 0.95) {
+                // Excellent success rate - make large jumps to find ceiling quickly
+                explorationSize = Math.min(Block.MAX_BATCH_SIZE, Math.floor(maxTestedSize * 1.5))
+            } else if (recentSuccessRate >= 0.9) {
+                // Very good success rate - moderate jumps
+                explorationSize = Math.min(Block.MAX_BATCH_SIZE, Math.floor(maxTestedSize * 1.3))
+            } else if (recentSuccessRate >= 0.8) {
+                // Good success rate - conservative jumps
+                explorationSize = Math.min(Block.MAX_BATCH_SIZE, maxTestedSize + 25)
+            } else {
+                // Decent success rate - small jumps
+                explorationSize = Math.min(Block.MAX_BATCH_SIZE, maxTestedSize + 15)
+            }
+
+            // Ensure we always make meaningful progress
+            if (explorationSize <= maxTestedSize) {
+                explorationSize = Math.min(Block.MAX_BATCH_SIZE, maxTestedSize + 20)
+            }
+
+            Block.batchSizeLastExplored.set(blockId, now)
+            optimalSize = explorationSize
+
+            if (Block.debug) {
+                const lastLogged = Block.batchSizeLastLogged.get(blockId) || 0
+                if ((now - lastLogged) > Block.LOG_INTERVAL) {
+                    // Check if we're seeing performance degradation with larger sizes
+                    const recentLargeBatches = successfulBatches
+                        .filter(b => b.size >= maxTestedSize * 0.8)
+                        .sort((a, b) => b.size - a.size)
+
+                    let ceilingWarning = ""
+                    if (recentLargeBatches.length >= 3) {
+                        const largest = recentLargeBatches[0]
+                        const secondLargest = recentLargeBatches[1]
+                        const thirdLargest = recentLargeBatches[2]
+
+                        // Check if throughput is declining with larger sizes
+                        const largestThroughput = largest.size / (largest.duration / 1000)
+                        const secondThroughput = secondLargest.size / (secondLargest.duration / 1000)
+                        const thirdThroughput = thirdLargest.size / (thirdLargest.duration / 1000)
+
+                        if (largestThroughput < secondThroughput && secondThroughput < thirdThroughput) {
+                            ceilingWarning = " ⚠️ Performance degrading with size - approaching ceiling"
+                            // When hitting ceiling, be less aggressive in exploration
+                            optimalSize = Math.min(optimalSize, maxTestedSize + 5)
+                        } else if (largestThroughput > thirdThroughput * 1.1) {
+                            ceilingWarning = " 🚀 Still gaining performance - pushing higher"
+                        }
+                    }
+
+                    console.log(`[Sharded] Aggressively exploring larger batch size for ${blockId}: ${explorationSize} (max tested: ${maxTestedSize}, success rate: ${recentSuccessRate.toFixed(2)})${ceilingWarning}`)
+                    Block.batchSizeLastLogged.set(blockId, now)
+                }
+            }
+        } else if (hasRecentTimeouts) {
+            // Special handling for recent timeout failures - scale down aggressively
+            const largestSuccessfulSize = Math.max(...successfulBatches.map(b => b.size))
+            const timeoutBatchSizes = recentTimeoutFailures.map(f => f.size).filter(s => s > 0)
+            const avgTimeoutSize = timeoutBatchSizes.length > 0 ?
+                Math.round(timeoutBatchSizes.reduce((sum, size) => sum + size, 0) / timeoutBatchSizes.length) : 0
+
+            // Use a size well below the timeout threshold
+            optimalSize = Math.max(Block.MIN_BATCH_SIZE, Math.floor(largestSuccessfulSize * 0.7))
+
+            if (Block.debug) {
+                const lastLogged = Block.batchSizeLastLogged.get(blockId) || 0
+                if ((now - lastLogged) > Block.LOG_INTERVAL) {
+                    console.log(`[Sharded] Recent timeout detected (avg timeout size: ${avgTimeoutSize}), scaling down to ${optimalSize} (was ${largestSuccessfulSize})`)
+                    Block.batchSizeLastLogged.set(blockId, now)
+                }
+            }
+        } else {
+            // Scale based on recent performance trends
+            const avgDuration = successfulBatches.reduce((sum, b) => sum + b.duration, 0) / successfulBatches.length
+
+            // Find the largest successful batch size as a reference point
+            const maxSuccessfulSize = Math.max(...successfulBatches.map(b => b.size))
+            const minReasonableSize = Math.max(Block.MIN_BATCH_SIZE, Math.floor(maxSuccessfulSize * 0.5))
+
+            if (recentSuccessRate >= 0.95 && avgDuration < performanceThreshold * 0.3) {
+                // Excellent performance with fast completion - scale up very aggressively
+                optimalSize = Math.min(Block.MAX_BATCH_SIZE, Math.floor(optimalSize * 1.6))
+            } else if (recentSuccessRate >= 0.95 && avgDuration < performanceThreshold * 0.5) {
+                // Excellent performance - scale up aggressively
+                optimalSize = Math.min(Block.MAX_BATCH_SIZE, Math.floor(optimalSize * 1.4))
+            } else if (recentSuccessRate >= 0.9 && avgDuration < performanceThreshold * 0.6) {
+                // Very good performance - moderate aggressive scaling
+                optimalSize = Math.min(Block.MAX_BATCH_SIZE, Math.floor(optimalSize * 1.2))
+            } else if (recentSuccessRate >= 0.8 && avgDuration < performanceThreshold * 0.7) {
+                // Good performance - conservative scaling
+                optimalSize = Math.min(Block.MAX_BATCH_SIZE, optimalSize + 10)
+            } else if (recentSuccessRate < 0.7) {
+                // Poor performance - scale down, but not below half of max successful size
+                optimalSize = Math.max(minReasonableSize, Math.floor(optimalSize * 0.8))
+            }
+
+            // Ensure we don't go below a reasonable minimum based on recent success
+            optimalSize = Math.max(minReasonableSize, optimalSize)
+
+            // Throttled logging
+            if (Block.debug) {
+                const lastLogged = Block.batchSizeLastLogged.get(blockId) || 0
+                if ((now - lastLogged) > Block.LOG_INTERVAL) {
+                    console.log(`[Sharded] Optimal batch size for ${blockId}: ${optimalSize} (success rate: ${recentSuccessRate.toFixed(2)}, efficiency: ${bestEfficiency.toFixed(1)})`)
+                    Block.batchSizeLastLogged.set(blockId, now)
+                }
+            }
         }
 
         return optimalSize
@@ -659,6 +882,63 @@ export class Block {
         }
 
         Block.batchPerformanceHistory.set(blockId, history)
+
+        // Debug logging for performance tracking
+        if (Block.debug && !success) {
+            console.log(`[Sharded] Batch FAILED for ${blockId}: size=${size}, duration=${duration}ms`)
+        }
+    }
+
+    /**
+     * Get batch performance statistics for debugging
+     */
+    static getBatchPerformanceStats(blockId: string): any {
+        const history = Block.batchPerformanceHistory.get(blockId) || []
+        if (history.length === 0) {
+            return { message: 'No performance history available' }
+        }
+
+        const successful = history.filter(h => h.success)
+        const failed = history.filter(h => !h.success)
+
+        // Group by batch size
+        const sizeStats = new Map<number, { count: number, avgDuration: number, successRate: number }>()
+
+        for (const record of history) {
+            const size = record.size
+            const existing = sizeStats.get(size)
+            if (existing) {
+                const totalDuration = existing.avgDuration * existing.count + record.duration
+                existing.count++
+                existing.avgDuration = totalDuration / existing.count
+                existing.successRate = history.filter(h => h.size === size && h.success).length / history.filter(h => h.size === size).length
+            } else {
+                sizeStats.set(size, {
+                    count: 1,
+                    avgDuration: record.duration,
+                    successRate: history.filter(h => h.size === size && h.success).length / history.filter(h => h.size === size).length
+                })
+            }
+        }
+
+        return {
+            totalBatches: history.length,
+            successfulBatches: successful.length,
+            failedBatches: failed.length,
+            overallSuccessRate: (successful.length / history.length * 100).toFixed(1) + '%',
+            avgDurationSuccess: successful.length > 0 ? (successful.reduce((sum, b) => sum + b.duration, 0) / successful.length).toFixed(1) + 'ms' : 'N/A',
+            sizeBreakdown: Object.fromEntries(
+                Array.from(sizeStats.entries()).map(([size, stats]) => [
+                    `size_${size}`,
+                    {
+                        count: stats.count,
+                        avgDuration: stats.avgDuration.toFixed(1) + 'ms',
+                        successRate: (stats.successRate * 100).toFixed(1) + '%',
+                        throughput: (size / (stats.avgDuration / 1000)).toFixed(1) + ' ops/sec'
+                    }
+                ])
+            )
+        }
     }
 
     /**
@@ -681,6 +961,10 @@ export class Block {
 
     static async create<T>(config: BlockConfig<T>) {
         const node = config.node ?? 'worker'
+
+        // Setup global error handlers on first use
+        Block.setupGlobalErrorHandlers()
+
         // Initialize Redis if not already done
         if (!Block.redis) {
             Block.redis = new Redis(config.connection ?? {
@@ -979,7 +1263,7 @@ export class Block {
             }
 
             if (Block.debug) {
-                console.log(`[Sharded] Waiting for ${pendingCount} pending syncs for block ${blockId}`)
+                console.log(`[Sharded] Waiting for ${pendingCount} pending syncs for block ${blockId}, (operationKey: ${operationQueueKey})`)
             }
 
             await new Promise(resolve => setTimeout(resolve, 100))
@@ -1433,6 +1717,7 @@ export class Block {
                 await batchQueue.waitUntilReady()
                 Block.blockQueues.set(blockId, batchQueue)
 
+                console.log(`[Sharded] Scheduling recurring batch processing every 100ms for ${blockId}`)
                 // Schedule recurring batch processing every 100ms
                 await batchQueue.upsertJobScheduler(`${blockId}_batch_processor`, {
                     every: 100, // 100ms
@@ -1513,15 +1798,22 @@ export class Block {
                 return
             }
 
+
             // Atomically get and remove operations to prevent race conditions
             const operationQueueKey = `block_operations:${blockId}`
 
             // Use MULTI/EXEC to atomically get operations and clear the list
             // Use adaptive batch size to prevent transaction timeouts
             const optimalBatchSize = Block.getOptimalBatchSize(blockId)
+
             const redisStartTime = Date.now()
             const multi = Block.redis?.multi()
-            if (!multi) return
+            if (!multi) {
+                if (Block.debug) {
+                    console.log(`[Sharded] Redis multi for block ${blockId} not found`)
+                }
+                return
+            }
 
             // Get limited number of operations and remove them atomically
             multi.lrange(operationQueueKey, 0, optimalBatchSize - 1)
@@ -1533,6 +1825,7 @@ export class Block {
                 return // No operations to process
             }
 
+            console.log('🔄 Batch sync operation started')
             const operations = results[0][1] as string[]
             if (operations.length === 0) {
                 return
@@ -1765,7 +2058,7 @@ export class Block {
                     if (queue) {
                         try {
                             await queue.add(`${blockId}_batch_processor`, { blockId }, {
-                                delay: 10, // Small delay to prevent overwhelming
+                                delay: 1, // Minimal delay for faster processing
                                 jobId: `${blockId}_immediate_${Date.now()}` // Unique job ID to prevent duplicates
                             })
                         } catch (queueErr) {
@@ -1816,6 +2109,34 @@ export class Block {
 
             if (Block.debug) {
                 console.log('🔄 Queued operation in Redis:', { operation, model, args })
+            }
+
+            // Trigger immediate batch processing if this is a new operation queue
+            // or if there might be a delay in processing
+            try {
+                const queue = Block.blockQueues.get(blockId)
+                if (queue) {
+                    // Check if there's already a job waiting/processing
+                    const waiting = await queue.getWaiting()
+                    const active = await queue.getActive()
+
+                    // If no jobs are pending, trigger immediate processing
+                    if (waiting.length === 0 && active.length === 0) {
+                        await queue.add(`${blockId}_batch_processor`, { blockId }, {
+                            delay: 1, // Minimal delay for immediate processing
+                            jobId: `${blockId}_trigger_${Date.now()}` // Unique job ID
+                        })
+
+                        if (Block.debug) {
+                            console.log(`🚀 Triggered immediate batch processing for ${blockId}`)
+                        }
+                    }
+                }
+            } catch (triggerErr) {
+                // Don't fail the operation if triggering fails
+                if (Block.debug) {
+                    console.log(`[Sharded] Failed to trigger immediate processing for ${blockId}:`, triggerErr)
+                }
             }
         } catch (err) {
             console.error('Error queueing operation in Redis:', err)
@@ -2215,8 +2536,6 @@ export class Block {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-
-
                         try {
                             if (Block.debug) {
                                 console.log('🔄 deleteMany', {
@@ -2481,7 +2800,7 @@ export class Block {
             // First, wait for ongoing operations to complete WITHOUT holding any locks
             // This allows sync operations to finish their work naturally
             const maxWaitTime = 3600000 // 60 minutes timeout for operations to complete
-            
+
             if (Block.debug) {
                 console.log(`[Sharded] Waiting for ongoing operations to complete before acquiring lock for block ${blockId}`)
             }
@@ -2512,7 +2831,7 @@ export class Block {
             // NOW acquire the block lock after operations have completed
             const blockLockKey = `block_lock:${blockId}`
             const processId = `${process.pid}_${Date.now()}`
-            
+
             let lockAcquired = false
             const lockWaitTime = 30000 // 30 seconds for lock acquisition
             const lockStartTime = Date.now()
