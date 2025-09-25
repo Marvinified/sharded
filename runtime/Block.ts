@@ -164,8 +164,10 @@ export class Block {
 
         // Handle unhandled promise rejections
         process.on('unhandledRejection', (reason, promise) => {
-            console.error('[Sharded] Unhandled Promise Rejection at:', promise)
-            console.error('[Sharded] Reason:', reason)
+            promise.catch(err => {
+                console.error('[Sharded] Unhandled Promise Rejection at:', err)
+            })
+            console.error('[Sharded] Unhandled Promise Rejection:', reason)
 
             if (Block.debug) {
                 console.error('[Sharded] Stack trace:', reason instanceof Error ? reason.stack : 'No stack trace available')
@@ -2587,8 +2589,6 @@ export class Block {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-
-
                         if (Block.debug) {
                             console.log('🔄 delete', {
                                 operation,
@@ -2616,29 +2616,25 @@ export class Block {
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
-                        try {
-                            if (Block.debug) {
-                                console.log('🔄 deleteMany', {
-                                    operation,
-                                    args,
-                                    model,
-                                    query,
-                                })
-                            }
-                            // Execute the delete in block DB first
-                            const result = await query(args)
-
-                            Block.updateLastSeenThrottled(blockId)
-                            // Queue the operation for main DB sync
-                            await Block.queue_operation(blockId, {
+                        if (Block.debug) {
+                            console.log('🔄 deleteMany', {
                                 operation,
-                                model,
                                 args,
+                                model,
+                                query,
                             })
-                            return result
-                        } finally {
-
                         }
+                        // Execute the delete in block DB first
+                        const result = await query(args)
+
+                        Block.updateLastSeenThrottled(blockId)
+                        // Queue the operation for main DB sync
+                        await Block.queue_operation(blockId, {
+                            operation,
+                            model,
+                            args,
+                        })
+                        return result
                     },
 
                     async findFirst({ operation, args, model, query }) {
@@ -2654,66 +2650,8 @@ export class Block {
                             })
                         }
 
-                        // Execute query with automatic WAL optimization and fallback
-                        const currentBlockClient = Block.blockClients.get(blockId)
-                        if (!currentBlockClient) {
-                            throw new Error(`Block client not found for ${blockId}`)
-                        }
-
-                        let result
-                        try {
-                            // Try with controlled transaction to prevent long-lived readers
-                            result = await currentBlockClient.$transaction(async (tx: any) => {
-                                return await (tx as any)[model.toLowerCase()][operation](args)
-                            }, {
-                                timeout: 30000, // Increased timeout for read operations under heavy load
-                                maxWait: 10000  // Increased maxWait for heavy load
-                            })
-                        } catch (txErr: any) {
-                            // If transaction fails, fallback to direct query (still better than failure)
-                            if (Block.debug) {
-                                console.log(`[Sharded] Transaction failed for ${model}.${operation}, using fallback:`, txErr.message)
-                            }
-                            result = await query(args)
-                        }
-
                         Block.updateLastSeenThrottled(blockId)
-
-                        // If no result found in block, check main database
-                        if (!result) {
-                            if (Block.debug) {
-                                console.log(`[Sharded] No result found in block for ${model}.findFirst, checking main database`)
-                            }
-
-                            try {
-                                const mainResult = await mainClient.$transaction(async (tx) => {
-                                    return await (tx as any)[model.toLowerCase()][operation](args)
-                                }, {
-                                    timeout: 30000, // Increased timeout for main client fallback
-                                    maxWait: 10000  // Increased maxWait for heavy load
-                                })
-
-                                if (mainResult) {
-                                    if (Block.debug) {
-                                        console.log(`[Sharded] Found result in main database for ${model}.findFirst, reloading block`)
-                                    }
-                                    // Reload block data since we found the record in main DB
-                                    await Block.reloadBlockData(blockId)
-                                    // Try the query again after reload with a fresh transaction
-                                    result = await currentBlockClient.$transaction(async (tx: any) => {
-                                        return await (tx as any)[model.toLowerCase()][operation](args)
-                                    }, {
-                                        timeout: 30000, // Increased timeout for block reload under heavy load
-                                        maxWait: 10000  // Increased maxWait for heavy load
-                                    })
-                                }
-                            } catch (mainErr) {
-                                if (Block.debug) {
-                                    console.log(`[Sharded] Main database query failed for ${model}.findFirst:`, mainErr)
-                                }
-                                // Continue with null result
-                            }
-                        }
+                        const result = await query(args)
 
                         return result
                     },
