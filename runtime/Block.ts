@@ -48,27 +48,33 @@ export type BlockConfig<T> = {
      * The loader function for the block
      */
     loader: (blockClient: T, mainClient: T) => Promise<void>
-} & (
-        {
-            node: 'master'
-            ttl?: number
-        } | {
-            node?: 'worker'
-        }
-    )
+    /**
+     * TTL for the block cache in seconds (used by watch() for invalidation)
+     */
+    ttl?: number
+}
 
 
 interface WatchOptions<T> {
     ttl?: number
-    interval?: number
     /**
-     * Interval in milliseconds to check for orphaned queues (blocks with items but no workers)
-     * Default: 30000 (30 seconds)
+     * Interval configuration for different watch processes
      */
-    orphanedQueueCheckInterval?: number
+    intervals?: {
+        /**
+         * Interval in milliseconds to check TTL-based invalidation
+         * Default: 10000 (10 seconds)
+         */
+        invalidation?: number
+        /**
+         * Interval in milliseconds to check for sync worker management
+         * Default: 2000 (2 seconds) for responsive sync operations
+         */
+        syncCheck?: number
+    }
     /**
-     * Main Prisma client to use for orphaned queue recovery
-     * Required for processing orphaned operations when Block.mainClients is empty
+     * Main Prisma client to use for sync worker creation
+     * Required for processing operations when Block.mainClients is empty
      */
     mainClient: T
     connection?: ConnectionOptions
@@ -974,8 +980,6 @@ export class Block {
     }
 
     static async create<T>(config: BlockConfig<T>) {
-        const node = config.node ?? 'worker'
-
         // Setup global error handlers on first use
         Block.setupGlobalErrorHandlers()
 
@@ -1012,7 +1016,7 @@ export class Block {
 
             // Update tracking for existing block  
             Block.updateLastSeenThrottled(config.blockId)
-            if (config.node === 'master' && config.ttl) {
+            if (config.ttl) {
                 Block.redis.hset("block_ttl", config.blockId, config.ttl)
             }
 
@@ -1024,50 +1028,15 @@ export class Block {
             return block
         }
 
-        let lockResolve: (() => void) | undefined
-        let redisLockAcquired = false
-
-        // Only acquire Redis lock if we actually need to create the block AND we're a master
-        if (needsCreation && node === 'master') {
-            // Use shared lock for both master creation and reload operations
-            const blockLockKey = `block_lock:${config.blockId}`
-            const processId = `${process.pid}_${Date.now()}`
-
-            // Try to acquire block lock with 30 second timeout
-            const maxWaitTime = 30000
-            const startTime = Date.now()
-
-            while (!redisLockAcquired && (Date.now() - startTime < maxWaitTime)) {
-                const result = await Block.redis.set(blockLockKey, processId, 'PX', 30000, 'NX')
-                if (result === 'OK') {
-                    redisLockAcquired = true
-                    if (Block.debug) {
-                        console.log(`[Sharded] Acquired block lock for master creation: ${config.blockId}`)
-                    }
-                } else {
-                    if (Block.debug) {
-                        console.log(`[Sharded] Block lock exists for ${config.blockId}, waiting...`)
-                    }
-                    await new Promise(resolve => setTimeout(resolve, 100))
-                }
-            }
-
-            if (!redisLockAcquired) {
-                throw new Error(`Failed to acquire block lock for block ${config.blockId} within timeout`)
-            }
-        }
-
         if (needsCreation) {
-            // Only lock during master creation to prevent multiple masters
-            // Workers can be created simultaneously as they just connect to existing SQLite
-            if (node === 'master') {
-                if (Block.debug) {
-                    console.log('[Sharded] Locking master creation of block:', config.blockId)
-                }
-                Block.locks.set(config.blockId, new Promise(resolve => {
-                    lockResolve = resolve
-                }))
+            // Lock during creation to prevent race conditions
+            if (Block.debug) {
+                console.log('[Sharded] Locking creation of block:', config.blockId)
             }
+            let lockResolve: (() => void) | undefined
+            Block.locks.set(config.blockId, new Promise(resolve => {
+                lockResolve = resolve
+            }))
 
             if (Block.debug) {
                 console.log('[Sharded] Creating new block:', config.blockId)
@@ -1094,13 +1063,51 @@ export class Block {
 
             // Create buffer database path
             const blockPath = join(dataDir, `${config.blockId}.sqlite`)
-            const reload = !existsSync(blockPath)
+            let needsInitialLoad = !existsSync(blockPath)
 
-            if (reload) {
-                if (Block.debug) {
-                    console.log('[Sharded] Block does not exist, creating:', blockPath)
+            let redisLockAcquired = false
+            let blockLockKey = ''
+            if (needsInitialLoad) {
+                // Acquire Redis lock only when creating SQLite file to prevent race conditions
+                blockLockKey = `block_lock:${config.blockId}`
+                const processId = `${process.pid}_${Date.now()}`
+
+                // Try to acquire block lock with 30 second timeout
+                const maxWaitTime = 30000
+                const startTime = Date.now()
+
+                while (!redisLockAcquired && (Date.now() - startTime < maxWaitTime)) {
+                    const result = await Block.redis.set(blockLockKey, processId, 'PX', 30000, 'NX')
+                    if (result === 'OK') {
+                        redisLockAcquired = true
+                        if (Block.debug) {
+                            console.log(`[Sharded] Acquired Redis lock for SQLite file creation: ${config.blockId}`)
+                        }
+                    } else {
+                        if (Block.debug) {
+                            console.log(`[Sharded] Redis lock exists for ${config.blockId}, waiting...`)
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 100))
+                    }
                 }
-                copyFileSync(templatePath, blockPath)
+
+                if (!redisLockAcquired) {
+                    throw new Error(`Failed to acquire Redis lock for SQLite file creation of block ${config.blockId} within timeout`)
+                }
+
+                // Double-check if file still doesn't exist after acquiring lock
+                if (!existsSync(blockPath)) {
+                    if (Block.debug) {
+                        console.log('[Sharded] Creating SQLite file from template:', blockPath)
+                    }
+                    copyFileSync(templatePath, blockPath)
+                } else {
+                    if (Block.debug) {
+                        console.log('[Sharded] SQLite file was created by another process while waiting for lock:', blockPath)
+                    }
+                    // File was created by another process, so don't run loader
+                    needsInitialLoad = false
+                }
             }
 
             // Create Prisma client for this block
@@ -1170,8 +1177,8 @@ export class Block {
                 console.log('[Sharded] Continuing with basic WAL mode (some optimizations disabled)')
             }
 
-            // Initialize worker queue for this block
-            await Block.init_queue(config.blockId, config.connection, node)
+            // Initialize queue for this block
+            await Block.init_queue(config.blockId, config.connection)
 
             // Track the block client and main client
             Block.blockClients.set(config.blockId, blockClient)
@@ -1192,13 +1199,13 @@ export class Block {
                 blockClientWithHooks,
             )
 
-            if (reload) {
+            if (needsInitialLoad) {
                 if (Block.debug) {
-                    console.log('[Sharded] Loading block data:', config.blockId)
+                    console.log('[Sharded] Loading initial block data:', config.blockId)
                 }
                 await config.loader(blockClient as T, config.client as T)
                 if (Block.debug) {
-                    console.log('[Sharded] Block data loaded:', config.blockId)
+                    console.log('[Sharded] Initial block data loaded:', config.blockId)
                 }
             }
 
@@ -1206,8 +1213,8 @@ export class Block {
                 console.log('[Sharded] Created block:', config.blockId)
             }
 
-            // Start WAL maintenance and health monitoring automatically for master nodes
-            if (node === 'master' && Block.blockClients.size === 1) {
+            // Start WAL maintenance and health monitoring automatically for first block
+            if (Block.blockClients.size === 1) {
                 if (Block.walMaintenanceEnabled && !Block.walMaintenanceInterval) {
                     await Block.startWalMaintenance(30000) // 30 second intervals
                 }
@@ -1225,18 +1232,17 @@ export class Block {
                 lockResolve()
             }
 
-            // Release Redis block lock if we acquired it
-            if (redisLockAcquired) {
-                const blockLockKey = `block_lock:${config.blockId}`
+            // Release Redis lock if we acquired it for SQLite file creation
+            if (redisLockAcquired && blockLockKey) {
                 await Block.redis?.del(blockLockKey)
                 if (Block.debug) {
-                    console.log(`[Sharded] Released block lock for ${config.blockId}`)
+                    console.log(`[Sharded] Released Redis lock for SQLite file creation: ${config.blockId}`)
                 }
             }
         }
 
 
-        if (config.node === 'master' && config.ttl) {
+        if (config.ttl) {
             Block.redis.hset("block_ttl", config.blockId, config.ttl)
         }
 
@@ -1641,7 +1647,7 @@ export class Block {
         })
     }
 
-    static async init_queue(blockId: string, connection?: ConnectionOptions, node?: 'master' | 'worker') {
+    static async init_queue(blockId: string, connection?: ConnectionOptions) {
         // Initialize Redis connection if not already done
         if (!Block.redis) {
             Block.redis = new Redis({
@@ -1655,49 +1661,9 @@ export class Block {
             })
         }
 
-        if (node === 'master' && !Block.blockWorkers.has(blockId)) {
-            // Create a batch processing worker that runs every 100ms
-            const worker = new Worker(`${blockId}_batch`, Block.batch_sync_operation, {
-                concurrency: 1,
-                connection: connection ?? {
-                    host: process.env.REDIS_HOST ?? 'localhost',
-                    port: process.env.REDIS_PORT
-                        ? parseInt(process.env.REDIS_PORT)
-                        : 6379,
-                    password: process.env.REDIS_PASSWORD,
-                    retryStrategy: function (times: number) {
-                        return Math.max(Math.min(Math.exp(times), 20000), 1000);
-                    },
-                    maxRetriesPerRequest: null,
-                    enableOfflineQueue: true,
-                },
-            })
-
-            worker.on("error", (error) => {
-                console.error("[sharded] Unhandled error in block batch sync worker", error);
-            });
-
-            // Handling unexpected shutdowns
-            process.on('SIGINT', () => {
-                console.log(`[sharded] Received SIGINT, shutting down block batch sync worker`);
-                worker.close();
-            });
-            process.on('SIGTERM', () => {
-                console.log(`[sharded] Received SIGTERM, shutting down block batch sync worker`);
-                worker.close();
-            });
-
-            try {
-                // Ensure worker is ready
-                await worker.waitUntilReady()
-                Block.blockWorkers.set(blockId, worker)
-            } catch (err) {
-                console.error('Error initializing batch worker:', err)
-                throw err
-            }
-
-            // Create the batch processing queue for this block
-            const batchQueue = new Queue(`${blockId}_batch`, {
+        // Only create queue connection if not already exists
+        if (!Block.blockQueues.has(blockId)) {
+            const queue = new Queue(`${blockId}_batch`, {
                 connection: connection ?? {
                     host: process.env.REDIS_HOST ?? 'localhost',
                     port: process.env.REDIS_PORT
@@ -1723,64 +1689,26 @@ export class Block {
                 },
             })
 
-            batchQueue.on("error", (error) => {
-                console.error(`[sharded][blocks] Unhandled error in batch queue ${batchQueue.name}`, error);
+            queue.on("error", (error) => {
+                console.error(`[sharded][blocks] Unhandled error in queue ${queue.name}`, error);
             });
 
             try {
-                await batchQueue.waitUntilReady()
-                Block.blockQueues.set(blockId, batchQueue)
-
-                console.log(`[Sharded] Scheduling recurring batch processing every 100ms for ${blockId}`)
-                // Schedule recurring batch processing every 100ms
-                await batchQueue.upsertJobScheduler(`${blockId}_batch_processor`, {
-                    every: 100, // 100ms
-                }, {
-                    name: `${blockId}_batch_processor`,
-                    data: { blockId },
-                })
-            } catch (err) {
-                console.error('Error initializing batch queue:', err)
-                throw err
-            }
-        } else if (node !== 'master') {
-            // Worker nodes need to connect to the existing queue created by master
-            if (!Block.blockQueues.has(blockId)) {
-                // Create a connection to the existing queue (without worker)
-                const existingQueue = new Queue(`${blockId}_batch`, {
-                    connection: connection ?? {
-                        host: process.env.REDIS_HOST ?? 'localhost',
-                        port: process.env.REDIS_PORT
-                            ? parseInt(process.env.REDIS_PORT)
-                            : 6379,
-                        password: process.env.REDIS_PASSWORD,
-                        retryStrategy: function (times: number) {
-                            return Math.max(Math.min(Math.exp(times), 20000), 1000);
-                        },
-                        enableOfflineQueue: false,
-                    },
-                })
-
-                try {
-                    await existingQueue.waitUntilReady()
-                    Block.blockQueues.set(blockId, existingQueue)
-                } catch (err) {
-                    console.error(`Error connecting to existing queue for worker node:`, err)
-                    throw err
+                await queue.waitUntilReady()
+                Block.blockQueues.set(blockId, queue)
+                
+                if (Block.debug) {
+                    console.log(`[Sharded] Created queue connection for block ${blockId}`)
                 }
+            } catch (err) {
+                console.error('Error initializing queue:', err)
+                throw err
             }
         }
 
         const queue = Block.blockQueues.get(blockId)
         if (!queue) {
-            // Provide detailed error information for debugging
-            const isWorkerNode = node !== 'master'
-            const hasWorker = Block.blockWorkers.has(blockId)
-            const redisConnected = Block.redis?.status === 'ready'
-
-            throw new Error(`Failed to initialize queue for block ${blockId}. Debug info: ` +
-                `node=${node}, isWorker=${isWorkerNode}, hasWorker=${hasWorker}, ` +
-                `redisStatus=${Block.redis?.status}, queueCount=${Block.blockQueues.size}`)
+            throw new Error(`Failed to initialize queue for block ${blockId}. Redis status: ${Block.redis?.status}`)
         }
         return queue
     }
@@ -3154,19 +3082,18 @@ export class Block {
 
 
     /**
-     * invalidation worker process
-     *  - Will watch every block created on this node/machine
-     *  - If block hasn't been accessed or written to longer than the ttl, configured on the master node
-     *  - It will run this check every 10 seconds (override with interval) on all blocks
-     *  - Also checks for orphaned queues (blocks with items but no workers) every 30 seconds
+     * Start watching processes for block management
+     *  - TTL-based invalidation: Checks if blocks haven't been accessed longer than their TTL
+     *  - Sync worker management: Creates/destroys sync workers based on pending operations
      * 
      * @param options
      * Watcher options:
-     *  - ttl: in seconds, The default ttl for all blocks, if not set on the master node
-     *  - interval: in milliseconds, The interval to check all blocks
-     *  - orphanedQueueCheckInterval: in milliseconds, The interval to check for orphaned queues
-     *  - mainClient: Main Prisma client for orphaned queue recovery (important after restarts)
-     *  - connection: The connection options for the queue
+     *  - ttl: in seconds, The default ttl for all blocks
+     *  - intervals: Object containing interval configurations
+     *    - invalidation: in milliseconds, TTL invalidation checks (default: 10000ms)
+     *    - syncWorkers: in milliseconds, sync worker management (default: 2000ms)
+     *  - mainClient: Main Prisma client for sync worker creation
+     *  - connection: The connection options for Redis
      *  */
 
     static async watch<T>(options: WatchOptions<T>) {
@@ -3184,7 +3111,7 @@ export class Block {
             },
         })
 
-        const orphanedQueue = new Queue('orphaned', {
+        const syncQueue = new Queue('sync-workers', {
             connection: options.connection ?? {
                 host: process.env.REDIS_HOST ?? 'localhost',
                 port: process.env.REDIS_PORT
@@ -3198,19 +3125,21 @@ export class Block {
             },
         })
 
+
         invalidationQueue.on("error", (error) => {
             console.error(`[sharded][watch] Unhandled error block invalidation queue: ${invalidationQueue.name}`, error);
         });
 
-        orphanedQueue.on("error", (error) => {
-            console.error(`[sharded][watch] Unhandled error block orphaned queue: ${orphanedQueue.name}`, error);
+        syncQueue.on("error", (error) => {
+            console.error(`[sharded][watch] Unhandled error sync worker queue: ${syncQueue.name}`, error);
         });
 
         await invalidationQueue.waitUntilReady()
-        await orphanedQueue.waitUntilReady()
+        await syncQueue.waitUntilReady()
 
+        // Schedule invalidation checks (default: every 10 seconds)
         await invalidationQueue.upsertJobScheduler("check-invalidation-every", {
-            every: options.interval ?? 10000,
+            every: options.intervals?.invalidation ?? 10000,
         }, {
             name: "check-invalidation-every",
             data: {
@@ -3218,19 +3147,22 @@ export class Block {
             },
         })
 
-        // Add scheduler for orphaned queue checks
-        await orphanedQueue.upsertJobScheduler("check-orphaned-queues-every", {
-            every: options.orphanedQueueCheckInterval ?? 30000,
+        // Schedule sync worker management (default: every 2 seconds for responsive sync)
+        await syncQueue.upsertJobScheduler("check-sync-workers-every", {
+            every: options.intervals?.syncCheck ?? 2000,
         }, {
-            name: "check-orphaned-queues-every",
+            name: "check-sync-workers-every",
             data: {},
         })
 
 
+
+        // Worker for TTL-based invalidation checks (runs every 10 seconds by default)
         new Worker(invalidationQueue.name, async (job: Job<{ ttl?: number }>) => {
             if (Block.debug) {
-                console.log('[Sharded] checking invalidation')
+                console.log('[Sharded] checking TTL-based invalidation')
             }
+            
             // Handle TTL-based invalidation
             const lastSeen = await Block.redis?.hgetall("last_seen")
             for (const blockId in lastSeen) {
@@ -3253,6 +3185,45 @@ export class Block {
                     }
                 }
             }
+
+            // Clean up idle sync workers (workers with empty queues that haven't been used recently)
+            try {
+                for (const [blockId, worker] of Block.blockWorkers.entries()) {
+                    // Check if this block has any pending operations
+                    const queueLength = await Block.redis?.llen(`block_operations:${blockId}`) || 0
+                    
+                    if (queueLength === 0) {
+                        // Check when this block was last seen
+                        const lastSeenStr = await Block.redis?.hget("last_seen", blockId)
+                        if (lastSeenStr) {
+                            const lastSeenTime = parseInt(lastSeenStr)
+                            const idleTime = Date.now() - lastSeenTime
+                            
+                            // Clean up workers that have been idle for more than 30 seconds
+                            if (idleTime > 30000) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] Cleaning up idle sync worker for block ${blockId} (idle for ${Math.round(idleTime/1000)}s)`)
+                                }
+                                
+                                await worker.close()
+                                Block.blockWorkers.delete(blockId)
+                                
+                                // Remove the recurring job
+                                const queue = Block.blockQueues.get(blockId)
+                                if (queue) {
+                                    try {
+                                        await queue.removeJobScheduler(`${blockId}_batch_processor`)
+                                    } catch (err) {
+                                        // Job scheduler might not exist, that's ok
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error('[Sharded] Error cleaning up idle sync workers:', err)
+            }
         }, {
             connection: options.connection ?? {
                 host: process.env.REDIS_HOST ?? 'localhost',
@@ -3268,11 +3239,80 @@ export class Block {
             },
         })
 
-        new Worker(orphanedQueue.name, async (job: Job<{ ttl?: number }>) => {
+        // Worker for sync worker management (runs every 2 seconds by default for responsive sync)
+        new Worker(syncQueue.name, async (job: Job) => {
             if (Block.debug) {
-                console.log('[Sharded] Checking for orphaned queues')
+                console.log('[Sharded] checking sync worker management')
             }
-            await Block.checkOrphanedQueues(options.mainClient, options.connection)
+            
+            try {
+                const operationKeys = await Block.redis?.keys('block_operations:*') || []
+                
+                for (const key of operationKeys) {
+                    const blockId = key.replace('block_operations:', '')
+                    const queueLength = await Block.redis?.llen(key) || 0
+                    
+                    if (queueLength > 0) {
+                        // Check if we already have a worker for this block
+                        const hasWorker = Block.blockWorkers.has(blockId)
+                        
+                        if (!hasWorker) {
+                            // Check if we have a main client available for this block
+                            let mainClient = Block.mainClients.get(blockId)
+                            if (!mainClient && options.mainClient) {
+                                // Use the provided fallback main client
+                                mainClient = options.mainClient as unknown as Prisma.DefaultPrismaClient
+                                Block.mainClients.set(blockId, mainClient)
+                            }
+                            
+                            if (mainClient) {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] Creating sync worker for block ${blockId} with ${queueLength} pending operations`)
+                                }
+                                
+                                // Create a sync worker for this block
+                                const worker = new Worker(`${blockId}_batch`, Block.batch_sync_operation, {
+                                    concurrency: 1,
+                                    connection: options.connection ?? {
+                                        host: process.env.REDIS_HOST ?? 'localhost',
+                                        port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+                                        password: process.env.REDIS_PASSWORD,
+                                        retryStrategy: function (times: number) {
+                                            return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                                        },
+                                        maxRetriesPerRequest: null,
+                                        enableOfflineQueue: true,
+                                    },
+                                })
+
+                                worker.on("error", (error) => {
+                                    console.error(`[sharded] Error in sync worker for block ${blockId}:`, error);
+                                });
+
+                                await worker.waitUntilReady()
+                                Block.blockWorkers.set(blockId, worker)
+                                
+                                // Schedule recurring batch processing every 100ms for this block
+                                const queue = Block.blockQueues.get(blockId)
+                                if (queue) {
+                                    await queue.upsertJobScheduler(`${blockId}_batch_processor`, {
+                                        every: 100, // 100ms
+                                    }, {
+                                        name: `${blockId}_batch_processor`,
+                                        data: { blockId },
+                                    })
+                                }
+                            } else {
+                                if (Block.debug) {
+                                    console.log(`[Sharded] No main client available for block ${blockId}, cannot create sync worker`)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error('[Sharded] Error managing sync workers:', err)
+            }
         }, {
             connection: options.connection ?? {
                 host: process.env.REDIS_HOST ?? 'localhost',
@@ -3280,7 +3320,14 @@ export class Block {
                     ? parseInt(process.env.REDIS_PORT)
                     : 6379,
                 password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                maxRetriesPerRequest: null,
+                enableOfflineQueue: true,
             },
         })
+
+        
     }
 }

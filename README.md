@@ -182,8 +182,7 @@ const blockClient = await Block.create({
   blockId: "user-orders-cache",
   client: mainClient,
   loader,
-  node: "master", // or 'worker'
-  ttl: 3600, // Cache TTL in seconds (master only)
+  ttl: 3600, // Cache TTL in seconds (optional)
   connection: {
     host: "localhost",
     port: 6379,
@@ -226,27 +225,29 @@ await blockClient.user.delete({
 
 ## 🏗️ Architecture
 
-### Master/Worker Nodes
-
-- **Master Node**: Manages cache invalidation and TTL
-- **Worker Node**: Processes write operations from the queue
+Block clients queue operations locally and to Redis. The `Block.watch()` method handles all background synchronization by automatically creating sync workers for blocks with pending operations.
 
 ```typescript
-// Master node (handles cache invalidation)
-const masterBlock = await Block.create({
+// Every block client works the same way
+const blockClient = await Block.create({
   blockId: "my-cache",
   client: mainClient,
   loader,
-  node: "master",
-  ttl: 3600, // 1 hour cache
+  ttl: 3600, // Optional: 1 hour cache
 });
 
-// Worker node (processes writes)
-const workerBlock = await Block.create({
-  blockId: "my-cache",
-  client: mainClient,
-  loader,
-  node: "worker",
+// Background sync is handled by Block.watch()
+await Block.watch({
+  ttl: 3600,
+  intervals: {
+    invalidation: 10000,   // Check TTL every 10 seconds
+    syncWorkers: 2000,     // Check sync workers every 2 seconds
+  },
+  mainClient: prismaClient, // Used for sync workers
+  connection: {
+    host: "localhost",
+    port: 6379,
+  },
 });
 ```
 
@@ -274,10 +275,8 @@ interface BlockConfig<T> {
     port: number;
     password?: string;
   };
-} & (
-  { node: 'master'; ttl?: number; } |
-  { node?: 'worker'; }
-);
+  ttl?: number;                      // Cache TTL in seconds (used by watch() for invalidation)
+};
 ```
 
 ### Block.invalidate(blockId)
@@ -298,14 +297,16 @@ await Block.delete_block("user-orders-cache");
 
 ### Block.watch(options)
 
-Start watching for cache invalidation and orphaned queue recovery (master nodes):
+Start watching for cache invalidation and sync worker management:
 
 ```typescript
 await Block.watch({
   ttl: 3600,
-  interval: 60000, // Check every minute
-  orphanedQueueCheckInterval: 30000, // Check for orphaned queues every 30 seconds
-  mainClient: prismaClient, // Required for orphaned queue recovery
+  intervals: {
+    invalidation: 10000,     // Check TTL invalidation every 10 seconds
+    syncWorkers: 2000,       // Check sync workers every 2 seconds (responsive)
+  },
+  mainClient: prismaClient, // Required for sync worker creation
   connection: {
     host: "localhost",
     port: 6379,
@@ -313,40 +314,7 @@ await Block.watch({
 });
 ```
 
-**Important**: The `mainClient` parameter is crucial for orphaned queue recovery. When a process restarts, the in-memory `Block.mainClients` map is empty, but Redis still contains queued operations. The provided `mainClient` enables recovery of these orphaned operations.
-
-### Block.getOrphanedQueues()
-
-Get information about blocks with queued operations but no active workers:
-
-```typescript
-const orphanedQueues = await Block.getOrphanedQueues();
-console.log(orphanedQueues);
-// Output: [{ blockId: "user-cache", queueLength: 5, hasWorker: false, hasQueue: true }]
-```
-
-### Block.checkOrphanedQueues(connection?, mainClient?)
-
-Manually check for and restart workers for orphaned queues:
-
-```typescript
-// Basic usage (uses existing mainClients if available)
-await Block.checkOrphanedQueues();
-
-// With main client for orphaned recovery
-await Block.checkOrphanedQueues(undefined, prismaClient);
-```
-
-### Block.createEphemeralRecoveryWorker(blockId, mainClient, connection?)
-
-Manually create an ephemeral recovery worker for a specific block (automatically called by `checkOrphanedQueues`):
-
-```typescript
-const mainClient = Block.mainClients.get("user-cache");
-await Block.createEphemeralRecoveryWorker("user-cache", mainClient);
-// Creates actual BullMQ worker that reuses batch_sync_operation logic
-// Processes all operations until queue is empty, then automatically closes itself
-```
+**Important**: The `mainClient` parameter is crucial for sync worker creation. When `Block.watch()` detects blocks with pending operations, it uses this client to create sync workers that process queued operations and sync them to the main database.
 
 ## ⚠️ Known Limitations
 
