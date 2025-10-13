@@ -95,6 +95,7 @@ export class Block {
     private static locks = new Map<string, Promise<void>>()
     private static redis: Redis | null = null
     private static debug = false
+    private static perfDebug = process.env.PERF_DEBUG === 'true'
     // Track active write operations separately (these DO block reloads)
     private static activeWriteOperations = new Map<string, number>()
     // Track blocks currently being invalidated
@@ -233,6 +234,7 @@ export class Block {
         expectedPath: string,
         blockId: string
     ): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         try {
             // Get the actual database path from SQLite
             const dbList = await client.$queryRaw`SELECT * FROM pragma_database_list;`
@@ -274,6 +276,11 @@ export class Block {
             }
 
             console.log(`[Sharded] ✓ Database path verified for ${blockId}: ${expectedPath}`)
+            
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] verifyDatabasePath: ${duration.toFixed(2)}ms`)
+            }
         } catch (err) {
             console.error(`[Sharded] Database path verification failed for ${blockId}:`, err)
             throw err
@@ -284,6 +291,7 @@ export class Block {
      * Get comprehensive WAL diagnostics for a block
      */
     static async getWalDiagnostics(blockId: string): Promise<any> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const blockClient = Block.blockClients.get(blockId)
         if (!blockClient) {
             return { error: 'Block client not found' }
@@ -323,6 +331,11 @@ export class Block {
                     checkpointed: (walCheckpoint as any[])[0]?.checkpointed
                 }
             }
+            
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] getWalDiagnostics: ${duration.toFixed(2)}ms`)
+            }
         } catch (err) {
             return {
                 blockId,
@@ -336,6 +349,7 @@ export class Block {
      * Force a WAL checkpoint for a specific block
      */
     static async forceWalCheckpoint(blockId: string, mode: 'PASSIVE' | 'FULL' | 'RESTART' | 'TRUNCATE' = 'FULL'): Promise<any> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const blockClient = Block.blockClients.get(blockId)
         if (!blockClient) {
             throw new Error(`Block client not found for ${blockId}`)
@@ -349,12 +363,19 @@ export class Block {
                 console.log(`[Sharded] WAL checkpoint (${mode}) result for ${blockId}:`, result)
             }
 
-            return {
+            const returnValue = {
                 blockId,
                 mode,
                 result: (result as any[])[0],
                 timestamp: new Date().toISOString()
             }
+            
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] forceWalCheckpoint (${mode}): ${duration.toFixed(2)}ms`)
+            }
+            
+            return returnValue
         } catch (err) {
             console.error(`[Sharded] WAL checkpoint failed for ${blockId}:`, err)
             throw err
@@ -365,6 +386,7 @@ export class Block {
      * Initialize periodic WAL maintenance for all blocks
      */
     static async startWalMaintenance(intervalMs: number = 30000): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (Block.walMaintenanceInterval) {
             clearInterval(Block.walMaintenanceInterval)
         }
@@ -409,6 +431,11 @@ export class Block {
 
         if (Block.debug) {
             console.log(`[Sharded] WAL maintenance started with ${intervalMs}ms interval`)
+        }
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] startWalMaintenance: ${duration.toFixed(2)}ms`)
         }
     }
 
@@ -507,6 +534,7 @@ export class Block {
      * Get WAL health status for all blocks
      */
     static async getWalHealthStatus(): Promise<any> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const blockIds = Array.from(Block.blockClients.keys())
         const healthStatus: any = {
             timestamp: new Date().toISOString(),
@@ -564,6 +592,11 @@ export class Block {
             }
         }
 
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] getWalHealthStatus: ${duration.toFixed(2)}ms`)
+        }
+
         return healthStatus
     }
 
@@ -572,6 +605,7 @@ export class Block {
      * This implements the "Fast diagnostics" section from the requirements
      */
     static async runWalDiagnostics(blockId?: string): Promise<any> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const blockIds = blockId ? [blockId] : Array.from(Block.blockClients.keys())
         const results: any = {
             timestamp: new Date().toISOString(),
@@ -682,6 +716,11 @@ export class Block {
                 'Ensure all processes use absolute paths in connection strings',
                 'Keep transactions short to prevent long-lived readers'
             )
+        }
+
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] runWalDiagnostics: ${duration.toFixed(2)}ms`)
         }
 
         return results
@@ -980,6 +1019,7 @@ export class Block {
     }
 
     static async create<T>(config: BlockConfig<T>) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Setup global error handlers on first use
         Block.setupGlobalErrorHandlers()
 
@@ -1255,13 +1295,19 @@ export class Block {
             throw new Error(`Failed to create or retrieve block: ${config.blockId}. It may have been invalidated during creation.`)
         }
 
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] create: ${duration.toFixed(2)}ms`)
+        }
+
         return block
     }
 
     /**
      * Wait for all pending sync operations to complete for a given block
      */
-    static async waitForPendingSyncs(blockId: string, timeoutMs: number = 30000): Promise<void> {
+    static async waitForPendingSyncs(blockId: string): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (!Block.redis) {
             if (Block.debug) {
                 console.log(`[Sharded] No Redis connection, assuming no pending syncs for block ${blockId}`)
@@ -1269,17 +1315,16 @@ export class Block {
             return
         }
 
-        const startTime = Date.now()
         const operationQueueKey = `block_operations:${blockId}`
 
-        while (Date.now() - startTime < timeoutMs) {
+        while (true) {
             const pendingCount = await Block.redis.llen(operationQueueKey)
 
             if (pendingCount === 0) {
                 if (Block.debug) {
                     console.log(`[Sharded] All syncs completed for block ${blockId}`)
                 }
-                return
+                break
             }
 
             if (Block.debug) {
@@ -1290,17 +1335,29 @@ export class Block {
         }
 
         console.warn(`[Sharded] Timeout waiting for pending syncs for block ${blockId}`)
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] waitForPendingSyncs: ${duration.toFixed(2)}ms`)
+        }
     }
 
     /**
      * Safely retrieve a block with retry logic to handle race conditions
      */
     static async safeGetBlock<T>(blockId: string, maxRetries = 3): Promise<T | null> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             const block = Block.blockClientsWithHooks.get(blockId)
             if (block) {
                 // Update last seen before returning
                 Block.updateLastSeenThrottled(blockId)
+                
+                if (Block.perfDebug) {
+                    const duration = performance.now() - startTime
+                    console.log(`⏱️  [PERF] safeGetBlock: ${duration.toFixed(2)}ms`)
+                }
+                
                 return block as T
             }
 
@@ -1309,6 +1366,12 @@ export class Block {
                 await new Promise(resolve => setTimeout(resolve, 100))
             }
         }
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] safeGetBlock (failed): ${duration.toFixed(2)}ms`)
+        }
+        
         return null
     }
 
@@ -1391,6 +1454,7 @@ export class Block {
      * Reload block data from main database using the configured loader
      */
     static async reloadBlockData(blockId: string): Promise<void> {
+        const perfStartTime = Block.perfDebug ? performance.now() : 0
         // Use the same shared lock as master creation - they are mutually exclusive
         const blockLockKey = `block_lock:${blockId}`
         const processId = `${process.pid}_${Date.now()}`
@@ -1508,6 +1572,11 @@ export class Block {
             await Block.redis?.del(blockLockKey)
             if (Block.debug) {
                 console.log(`[Sharded] Released block lock for ${blockId}`)
+            }
+            
+            if (Block.perfDebug) {
+                const duration = performance.now() - perfStartTime
+                console.log(`⏱️  [PERF] reloadBlockData: ${duration.toFixed(2)}ms`)
             }
         }
     }
@@ -1632,6 +1701,7 @@ export class Block {
     }
 
     static async delete_block(blockId: string) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const baseDir = join(process.cwd(), 'prisma', 'blocks', 'data')
         const blockPath = join(baseDir, `${blockId}.sqlite`)
         // Delete SQLite database files using glob pattern
@@ -1645,9 +1715,15 @@ export class Block {
                 unlinkSync(filePath)
             }
         })
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] delete_block: ${duration.toFixed(2)}ms`)
+        }
     }
 
     static async init_queue(blockId: string, connection?: ConnectionOptions) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Initialize Redis connection if not already done
         if (!Block.redis) {
             Block.redis = new Redis({
@@ -1696,7 +1772,7 @@ export class Block {
             try {
                 await queue.waitUntilReady()
                 Block.blockQueues.set(blockId, queue)
-                
+
                 if (Block.debug) {
                     console.log(`[Sharded] Created queue connection for block ${blockId}`)
                 }
@@ -1710,6 +1786,12 @@ export class Block {
         if (!queue) {
             throw new Error(`Failed to initialize queue for block ${blockId}. Redis status: ${Block.redis?.status}`)
         }
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] init_queue: ${duration.toFixed(2)}ms`)
+        }
+        
         return queue
     }
 
@@ -1719,6 +1801,7 @@ export class Block {
     ) {
         const { blockId } = job.data
         const startTime = Date.now()
+        const perfStartTime = Block.perfDebug ? performance.now() : 0
 
         let timings = {
             total: 0,
@@ -2026,6 +2109,11 @@ export class Block {
             const totalTime = Date.now() - startTime
             console.error(`[Sharded] Error in batch sync for block ${blockId} after ${totalTime}ms:`, err)
             // Don't re-throw to avoid failing the recurring job
+        } finally {
+            if (Block.perfDebug) {
+                const duration = performance.now() - perfStartTime
+                console.log(`⏱️  [PERF] batch_sync_operation: ${duration.toFixed(2)}ms`)
+            }
         }
     }
 
@@ -2037,6 +2125,7 @@ export class Block {
             args,
         }: { operation: string; model: string; args: any },
     ) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (!Block.redis) {
             if (Block.debug) {
                 console.log(`[Sharded] Redis not available for block ${blockId}`)
@@ -2091,6 +2180,11 @@ export class Block {
         } catch (err) {
             console.error('Error queueing operation in Redis:', err)
             throw err
+        } finally {
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] queue_operation (${operation} ${model}): ${duration.toFixed(2)}ms`)
+            }
         }
     }
 
@@ -2098,12 +2192,13 @@ export class Block {
      * Get failed operations from the dead letter queue
      */
     static async getFailedOperations(blockId: string): Promise<any[]> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (!Block.redis) return []
 
         const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
         const failedOps = await Block.redis.lrange(deadLetterKey, 0, -1)
 
-        return failedOps.map(op => {
+        const result = failedOps.map(op => {
             try {
                 return JSON.parse(op)
             } catch (err) {
@@ -2111,17 +2206,30 @@ export class Block {
                 return null
             }
         }).filter(op => op !== null)
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] getFailedOperations: ${duration.toFixed(2)}ms`)
+        }
+        
+        return result
     }
 
     /**
      * Clear failed operations from the dead letter queue
      */
     static async clearFailedOperations(blockId: string): Promise<number> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (!Block.redis) return 0
 
         const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
         const count = await Block.redis.llen(deadLetterKey)
         await Block.redis.del(deadLetterKey)
+
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] clearFailedOperations: ${duration.toFixed(2)}ms`)
+        }
 
         return count
     }
@@ -2130,6 +2238,7 @@ export class Block {
      * Retry failed operations (move them back to the main queue)
      */
     static async retryFailedOperations(blockId: string, maxOperations?: number): Promise<number> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (!Block.redis) return 0
 
         const deadLetterKey = `${Block.FAILED_OPERATIONS_KEY_PREFIX}:${blockId}`
@@ -2171,6 +2280,11 @@ export class Block {
             console.log(`[Sharded] Retried ${operations.length} failed operations for block ${blockId}`)
         }
 
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] retryFailedOperations: ${duration.toFixed(2)}ms`)
+        }
+
         return operations.length
     }
 
@@ -2178,6 +2292,7 @@ export class Block {
      * Gracefully wait for all pending operations to complete before shutdown
      */
     static async gracefulShutdown(timeoutMs: number = 10000): Promise<void> {
+        const perfStartTime = Block.perfDebug ? performance.now() : 0
         console.log('[Sharded] Starting graceful shutdown...')
 
         // Stop WAL maintenance first
@@ -2220,12 +2335,18 @@ export class Block {
         }
 
         console.warn(`[Sharded] Shutdown timeout reached, ${Date.now() - startTime}ms elapsed`)
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - perfStartTime
+            console.log(`⏱️  [PERF] gracefulShutdown: ${duration.toFixed(2)}ms`)
+        }
     }
 
     /**
      * Force flush all pending batches for graceful shutdown
      */
     static async flushAllPendingBatches(): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const blockIds = Array.from(Block.blockQueues.keys())
 
         for (const blockId of blockIds) {
@@ -2244,6 +2365,11 @@ export class Block {
         }
 
         console.log('[Sharded] Triggered immediate batch processing for all blocks')
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] flushAllPendingBatches: ${duration.toFixed(2)}ms`)
+        }
     }
 
 
@@ -2251,6 +2377,7 @@ export class Block {
      * Get orphaned queue information (blocks with items but no workers)
      */
     static async getOrphanedQueues(): Promise<Array<{ blockId: string, queueLength: number, hasWorker: boolean, hasQueue: boolean }>> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Initialize Redis connection if not already done
         if (!Block.redis) {
             Block.redis = new Redis({
@@ -2292,6 +2419,11 @@ export class Block {
             throw error
         }
 
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] getOrphanedQueues: ${duration.toFixed(2)}ms`)
+        }
+
         return orphanedQueues
     }
 
@@ -2299,6 +2431,7 @@ export class Block {
      * Get diagnostic information about the sync workers and queues
      */
     static async getDiagnostics(): Promise<any> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const diagnostics: any = {
             redis_status: Block.redis?.status,
             active_blocks: [],
@@ -2356,6 +2489,11 @@ export class Block {
         diagnostics.ongoing_recovery_workers = Array.from(Block.ongoingRecoveryWorkers)
         diagnostics.recovery_client_count = Block.recoveryMainClients.size
 
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] getDiagnostics: ${duration.toFixed(2)}ms`)
+        }
+
         return diagnostics
     }
 
@@ -2363,6 +2501,7 @@ export class Block {
         client: Prisma.DefaultPrismaClient,
         blockId: string,
     ) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const mainClient = await Block.mainClients.get(blockId)
         if (!mainClient) {
             throw new Error(`Main client for ${blockId} not found`)
@@ -2373,6 +2512,8 @@ export class Block {
             query: {
                 $allModels: {
                     async create({ operation, args, model, query, ...rest }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2401,10 +2542,18 @@ export class Block {
                                 },
                             },
                         })
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] create ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async createMany({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2437,10 +2586,18 @@ export class Block {
                             model,
                             args,
                         })
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] createMany ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async update({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2462,10 +2619,18 @@ export class Block {
                             args,
                         })
                         Block.updateLastSeenThrottled(blockId)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] update ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async updateMany({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2486,10 +2651,18 @@ export class Block {
                             model,
                             args,
                         })
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] updateMany ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async upsert({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2509,11 +2682,19 @@ export class Block {
                             model,
                             args,
                         })
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] upsert ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
 
                     },
 
                     async delete({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2536,11 +2717,19 @@ export class Block {
                             model,
                             args,
                         })
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] delete ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
 
                     },
 
                     async deleteMany({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2562,10 +2751,18 @@ export class Block {
                             model,
                             args,
                         })
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] deleteMany ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async findFirst({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2581,10 +2778,17 @@ export class Block {
                         Block.updateLastSeenThrottled(blockId)
                         const result = await query(args)
 
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] findFirst ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async findMany({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2599,10 +2803,18 @@ export class Block {
                             })
                         }
                         const result = await query(args)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] findMany ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async findUnique({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2618,10 +2830,18 @@ export class Block {
                             })
                         }
                         const result = await query(args)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] findUnique ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async findUniqueOrThrow({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2639,10 +2859,18 @@ export class Block {
                         const result = await query(args)
 
                         Block.updateLastSeenThrottled(blockId)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] findUniqueOrThrow ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     async findFirstOrThrow({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
                         if (Block.debug) {
@@ -2656,11 +2884,19 @@ export class Block {
 
                         const result = await query(args)
                         Block.updateLastSeenThrottled(blockId)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] findFirstOrThrow ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
 
                     // these need to be pulled directly from the main client, Ideally you don't want to do this
                     async count({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2677,12 +2913,20 @@ export class Block {
                             })
                         }
                         const result = await query(args)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] count ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
 
 
                     },
 
                     async aggregate({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
 
@@ -2699,12 +2943,20 @@ export class Block {
                             })
                         }
                         const result = await query(args)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] aggregate ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
 
 
                     },
 
                     async groupBy({ operation, args, model, query }) {
+                        const startTime = Block.perfDebug ? performance.now() : 0
+
                         // Wait for any locks (master creation/reload) to complete before executing
                         await Block.waitForBlockReady(blockId)
                         Block.updateLastSeenThrottled(blockId)
@@ -2718,16 +2970,28 @@ export class Block {
                             })
                         }
                         const result = await query(args)
+
+                        if (Block.perfDebug) {
+                            const duration = performance.now() - startTime
+                            console.log(`⏱️  [PERF] groupBy ${model}: ${duration.toFixed(2)}ms`)
+                        }
+
                         return result
                     },
                 },
             },
         })
 
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] add_hooks: ${duration.toFixed(2)}ms`)
+        }
+
         return newClient as typeof client & Prisma.DefaultPrismaClient
     }
 
     static async invalidate(blockId: string): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         if (Block.debug) {
             console.log('[Sharded] Starting invalidation of block:', blockId)
         }
@@ -2772,7 +3036,7 @@ export class Block {
             if (Block.debug) {
                 console.log(`[Sharded] Waiting for pending syncs before acquiring lock for block ${blockId}`)
             }
-            await Block.waitForPendingSyncs(blockId, maxWaitTime)
+            await Block.waitForPendingSyncs(blockId)
 
             // NOW acquire the block lock after operations have completed
             const blockLockKey = `block_lock:${blockId}`
@@ -2888,6 +3152,11 @@ export class Block {
             } else if (Block.debug && lockValue) {
                 console.log(`[Sharded] Block lock for ${blockId} owned by different process, not releasing`)
             }
+            
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] invalidate: ${duration.toFixed(2)}ms`)
+            }
         }
     }
 
@@ -2896,6 +3165,7 @@ export class Block {
      * and create ephemeral recovery workers that process all operations until done
      */
     static async checkOrphanedQueues<T>(mainClient: T | Prisma.DefaultPrismaClient, connection?: ConnectionOptions): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Initialize Redis connection if not already done
         if (!Block.redis) {
             Block.redis = new Redis({
@@ -2954,6 +3224,11 @@ export class Block {
         } catch (error) {
             console.error('[Sharded] Error checking orphaned queues:', error)
         }
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] checkOrphanedQueues: ${duration.toFixed(2)}ms`)
+        }
     }
 
     /**
@@ -2965,6 +3240,7 @@ export class Block {
         mainClient: any,
         connection?: ConnectionOptions
     ): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Initialize Redis connection if not already done
         if (!Block.redis) {
             Block.redis = new Redis({
@@ -3078,6 +3354,11 @@ export class Block {
             removeOnComplete: true,
             removeOnFail: false,
         })
+        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] createEphemeralRecoveryWorker: ${duration.toFixed(2)}ms`)
+        }
     }
 
 
@@ -3097,6 +3378,7 @@ export class Block {
      *  */
 
     static async watch<T>(options: WatchOptions<T>) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const invalidationQueue = new Queue('invalidation', {
             connection: options.connection ?? {
                 host: process.env.REDIS_HOST ?? 'localhost',
@@ -3162,12 +3444,13 @@ export class Block {
             if (Block.debug) {
                 console.log('[Sharded] checking TTL-based invalidation')
             }
-            
+
             // Handle TTL-based invalidation
             const lastSeen = await Block.redis?.hgetall("last_seen")
+            const blockTtls = await Block.redis?.hgetall("block_ttl")
             for (const blockId in lastSeen) {
                 const lastSeenTime = parseInt(lastSeen[blockId])
-                const blockTtl = parseInt((await Block.redis?.hget("block_ttl", blockId)) ?? `${job.data.ttl ?? 60}`) * 1000
+                const blockTtl = parseInt(blockTtls?.[blockId] ?? `${job.data.ttl ?? 60}`) * 1000
                 if (Date.now() - lastSeenTime > blockTtl) {
                     // Check if block has active operations, creation, or reload before invalidating
                     if (await Block.canInvalidate(blockId)) {
@@ -3191,23 +3474,23 @@ export class Block {
                 for (const [blockId, worker] of Block.blockWorkers.entries()) {
                     // Check if this block has any pending operations
                     const queueLength = await Block.redis?.llen(`block_operations:${blockId}`) || 0
-                    
+
                     if (queueLength === 0) {
                         // Check when this block was last seen
                         const lastSeenStr = await Block.redis?.hget("last_seen", blockId)
                         if (lastSeenStr) {
                             const lastSeenTime = parseInt(lastSeenStr)
                             const idleTime = Date.now() - lastSeenTime
-                            
+
                             // Clean up workers that have been idle for more than 30 seconds
                             if (idleTime > 30000) {
                                 if (Block.debug) {
-                                    console.log(`[Sharded] Cleaning up idle sync worker for block ${blockId} (idle for ${Math.round(idleTime/1000)}s)`)
+                                    console.log(`[Sharded] Cleaning up idle sync worker for block ${blockId} (idle for ${Math.round(idleTime / 1000)}s)`)
                                 }
-                                
+
                                 await worker.close()
                                 Block.blockWorkers.delete(blockId)
-                                
+
                                 // Remove the recurring job
                                 const queue = Block.blockQueues.get(blockId)
                                 if (queue) {
@@ -3244,18 +3527,18 @@ export class Block {
             if (Block.debug) {
                 console.log('[Sharded] checking sync worker management')
             }
-            
+
             try {
                 const operationKeys = await Block.redis?.keys('block_operations:*') || []
-                
+
                 for (const key of operationKeys) {
                     const blockId = key.replace('block_operations:', '')
                     const queueLength = await Block.redis?.llen(key) || 0
-                    
+
                     if (queueLength > 0) {
                         // Check if we already have a worker for this block
                         const hasWorker = Block.blockWorkers.has(blockId)
-                        
+
                         if (!hasWorker) {
                             // Check if we have a main client available for this block
                             let mainClient = Block.mainClients.get(blockId)
@@ -3264,12 +3547,12 @@ export class Block {
                                 mainClient = options.mainClient as unknown as Prisma.DefaultPrismaClient
                                 Block.mainClients.set(blockId, mainClient)
                             }
-                            
+
                             if (mainClient) {
                                 if (Block.debug) {
                                     console.log(`[Sharded] Creating sync worker for block ${blockId} with ${queueLength} pending operations`)
                                 }
-                                
+
                                 // Create a sync worker for this block
                                 const worker = new Worker(`${blockId}_batch`, Block.batch_sync_operation, {
                                     concurrency: 1,
@@ -3291,7 +3574,7 @@ export class Block {
 
                                 await worker.waitUntilReady()
                                 Block.blockWorkers.set(blockId, worker)
-                                
+
                                 // Schedule recurring batch processing every 100ms for this block
                                 const queue = Block.blockQueues.get(blockId)
                                 if (queue) {
@@ -3328,6 +3611,9 @@ export class Block {
             },
         })
 
-        
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] watch: ${duration.toFixed(2)}ms`)
+        }
     }
 }
