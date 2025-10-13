@@ -1004,6 +1004,7 @@ export class Block {
      * Update last seen time for a block, but throttled to avoid excessive Redis calls
      */
     static updateLastSeenThrottled(blockId: string) {
+        const startTime = Block.perfDebug ? performance.now() : 0 
         const now = Date.now()
         const lastUpdate = Block.lastSeenUpdateTimes.get(blockId) || 0
 
@@ -1015,6 +1016,11 @@ export class Block {
                     console.error('[Sharded] Error updating last_seen:', err)
                 }
             })
+        }
+
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] updateLastSeenThrottled: ${duration.toFixed(2)}ms`)
         }
     }
 
@@ -1585,9 +1591,15 @@ export class Block {
      * Check if block is locked for creation or reload (cross-process) with caching
      */
     static async waitForBlockReady(blockId: string): Promise<void> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Fast path: check in-process locks first (no Redis call needed)
         if (Block.locks.has(blockId)) {
             await Block.locks.get(blockId)
+            
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] waitForBlockReady (in-process lock): ${duration.toFixed(2)}ms`)
+            }
             return
         }
 
@@ -1597,6 +1609,10 @@ export class Block {
 
         if (cached && (now - cached.lastChecked) < Block.LOCK_CACHE_TTL) {
             if (!cached.isLocked) {
+                if (Block.perfDebug) {
+                    const duration = performance.now() - startTime
+                    console.log(`⏱️  [PERF] waitForBlockReady (cached): ${duration.toFixed(2)}ms`)
+                }
                 return // Cache says no lock, proceed immediately
             }
         }
@@ -1612,15 +1628,19 @@ export class Block {
         })
 
         if (!blockLockExists) {
+            if (Block.perfDebug) {
+                const duration = performance.now() - startTime
+                console.log(`⏱️  [PERF] waitForBlockReady (no lock): ${duration.toFixed(2)}ms`)
+            }
             return // Block is ready for operations
         }
 
         // If locked, wait with exponential backoff
         const maxWaitTime = 30000
-        const startTime = Date.now()
+        const waitStartTime = Date.now()
         let backoffDelay = 100
 
-        while (Date.now() - startTime < maxWaitTime) {
+        while (Date.now() - waitStartTime < maxWaitTime) {
             if (Block.debug) {
                 console.log(`[Sharded] Waiting for block operation (master creation/reload) to complete for block ${blockId}`)
             }
@@ -1637,6 +1657,10 @@ export class Block {
             })
 
             if (!blockLockExists && !Block.locks.has(blockId)) {
+                if (Block.perfDebug) {
+                    const duration = performance.now() - startTime
+                    console.log(`⏱️  [PERF] waitForBlockReady (waited): ${duration.toFixed(2)}ms`)
+                }
                 return // Block is ready for operations
             }
         }
@@ -1648,10 +1672,15 @@ export class Block {
      * Increment the write operation count for a block (blocks reloads)
      */
     static incrementWriteOperationCount(blockId: string) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const current = Block.activeWriteOperations.get(blockId) || 0
         Block.activeWriteOperations.set(blockId, current + 1)
         if (Block.debug) {
             console.log(`[Sharded] Write operation count for ${blockId}: ${current + 1}`)
+        }
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] incrementWriteOperationCount: ${duration.toFixed(2)}ms`)
         }
     }
 
@@ -1659,6 +1688,7 @@ export class Block {
      * Decrement the write operation count for a block
      */
     static decrementWriteOperationCount(blockId: string) {
+        const startTime = Block.perfDebug ? performance.now() : 0
         const current = Block.activeWriteOperations.get(blockId) || 0
         if (current > 1) {
             Block.activeWriteOperations.set(blockId, current - 1)
@@ -1668,12 +1698,17 @@ export class Block {
         if (Block.debug) {
             console.log(`[Sharded] Write operation count for ${blockId}: ${Math.max(0, current - 1)}`)
         }
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] decrementWriteOperationCount: ${duration.toFixed(2)}ms`)
+        }
     }
 
     /**
      * Check if a block can be safely invalidated (no active write operations, creation, or reload)
      */
     static async canInvalidate(blockId: string): Promise<boolean> {
+        const startTime = Block.perfDebug ? performance.now() : 0
         // Check for active write operations and double invalidation
         if (Block.activeWriteOperations.has(blockId) || Block.invalidatingBlocks.has(blockId)) {
             return false
@@ -1695,6 +1730,11 @@ export class Block {
                 console.log(`[Sharded] Cannot invalidate ${blockId}: in-process lock exists`)
             }
             return false
+        }
+
+        if (Block.perfDebug) {
+            const duration = performance.now() - startTime
+            console.log(`⏱️  [PERF] canInvalidate: ${duration.toFixed(2)}ms`)
         }
 
         return true
@@ -2528,7 +2568,12 @@ export class Block {
                             })
                         }
                         // Execute in block DB first to get the ID
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(create ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         // Queue the operation with the result's ID
                         await Block.queue_operation(blockId, {
@@ -2580,7 +2625,12 @@ export class Block {
 
                         args = { ...args, data: data as any }
 
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(createMany ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
                         await Block.queue_operation(blockId, {
                             operation,
                             model,
@@ -2611,7 +2661,12 @@ export class Block {
                         }
 
 
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(update ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         await Block.queue_operation(blockId, {
                             operation,
@@ -2642,7 +2697,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(updateMany ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
 
                         Block.updateLastSeenThrottled(blockId)
@@ -2674,7 +2734,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(upsert ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         Block.updateLastSeenThrottled(blockId)
                         await Block.queue_operation(blockId, {
@@ -2708,7 +2773,12 @@ export class Block {
                         }
 
                         // Execute the delete in block DB first
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(delete ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         Block.updateLastSeenThrottled(blockId)
                         // Queue the operation for main DB sync
@@ -2742,7 +2812,12 @@ export class Block {
                             })
                         }
                         // Execute the delete in block DB first
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(deleteMany ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         Block.updateLastSeenThrottled(blockId)
                         // Queue the operation for main DB sync
@@ -2776,7 +2851,12 @@ export class Block {
                         }
 
                         Block.updateLastSeenThrottled(blockId)
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(findFirst ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         if (Block.perfDebug) {
                             const duration = performance.now() - startTime
@@ -2802,7 +2882,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(findMany ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         if (Block.perfDebug) {
                             const duration = performance.now() - startTime
@@ -2829,7 +2914,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(findUnique ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         if (Block.perfDebug) {
                             const duration = performance.now() - startTime
@@ -2856,7 +2946,12 @@ export class Block {
                             })
                         }
 
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(findUniqueOrThrow ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         Block.updateLastSeenThrottled(blockId)
 
@@ -2882,7 +2977,12 @@ export class Block {
                             })
                         }
 
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(findFirstOrThrow ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
                         Block.updateLastSeenThrottled(blockId)
 
                         if (Block.perfDebug) {
@@ -2912,7 +3012,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(count ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         if (Block.perfDebug) {
                             const duration = performance.now() - startTime
@@ -2942,7 +3047,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(aggregate ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         if (Block.perfDebug) {
                             const duration = performance.now() - startTime
@@ -2969,7 +3079,12 @@ export class Block {
                                 query,
                             })
                         }
+                        const queryStartTime = Block.perfDebug ? performance.now() : 0
                         const result = await query(args)
+                        if (Block.perfDebug) {
+                            const queryDuration = performance.now() - queryStartTime
+                            console.log(`⏱️  [PERF] query(groupBy ${model}): ${queryDuration.toFixed(2)}ms`)
+                        }
 
                         if (Block.perfDebug) {
                             const duration = performance.now() - startTime
