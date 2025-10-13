@@ -5,19 +5,6 @@
 
 **Sharded** is a SQLite-based write buffer and caching system for Prisma that provides high-performance data operations with automatic synchronization to your main database.
 
-## ✨ **NEW: Automatic WAL Optimizations**
-
-🎉 **Zero configuration required!** Sharded now automatically handles all SQLite WAL optimizations:
-
-- **🔒 Prevents "phantom data" issues** - All processes use absolute paths automatically
-- **⚡ Perfect SQLite settings** - Optimal PRAGMA configuration applied automatically  
-- **🔄 Auto WAL maintenance** - Checkpointing and cleanup every 30 seconds
-- **🏥 Health monitoring** - Auto-detection and recovery from WAL issues
-- **⏱️ Smart transactions** - Short-lived reads prevent blocking
-- **🛡️ Graceful fallbacks** - Automatic error recovery
-
-Just use `Block.create()` normally - all optimizations work behind the scenes!
-
 ## 🚀 Performance Benefits
 
 - **Dramatic Speed Improvement**: Reduce write & read times from >100ms to <10ms
@@ -236,12 +223,13 @@ const blockClient = await Block.create({
   ttl: 3600, // Optional: 1 hour cache
 });
 
-// Background sync is handled by Block.watch()
+// Background sync and cleanup handled by Block.watch()
 await Block.watch({
   ttl: 3600,
   intervals: {
     invalidation: 10000,   // Check TTL every 10 seconds
-    syncWorkers: 2000,     // Check sync workers every 2 seconds
+    syncCheck: 2000,       // Check sync workers every 2 seconds
+    cleanup: 3600000,      // Clean Redis every hour (prevents performance degradation)
   },
   mainClient: prismaClient, // Used for sync workers
   connection: {
@@ -255,7 +243,6 @@ await Block.watch({
 
 1. **Writes**: Buffered in SQLite → Queued in Redis → Synced to main DB
 2. **Reads**: Check SQLite cache → Fallback to main DB → Cache result
-3. **Invalidation**: Automatic TTL-based or manual invalidation
 
 ## 📚 API Reference
 
@@ -297,16 +284,36 @@ await Block.delete_block("user-orders-cache");
 
 ### Block.watch(options)
 
-Start watching for cache invalidation and sync worker management:
+Start watching for cache invalidation, sync worker management, and automatic Redis cleanup.
 
+**Interface:**
+```typescript
+interface WatchOptions<T> {
+  ttl?: number;                  // Default TTL in seconds for all blocks
+  intervals?: {
+    invalidation?: number;       // Check TTL invalidation (ms, default: 10000)
+    syncCheck?: number;          // Check sync workers (ms, default: 2000)
+    cleanup?: number;            // Redis cleanup (ms, default: 3600000, set 0 to disable)
+  };
+  mainClient: T;                 // Required: Main Prisma client for sync worker creation
+  connection?: {                 // Redis connection options
+    host: string;
+    port: number;
+    password?: string;
+  };
+}
+```
+
+**Example:**
 ```typescript
 await Block.watch({
-  ttl: 3600,
+  ttl: 3600,                    // Cache TTL in seconds
   intervals: {
-    invalidation: 10000,     // Check TTL invalidation every 10 seconds
-    syncWorkers: 2000,       // Check sync workers every 2 seconds (responsive)
+    invalidation: 10000,        // Check TTL invalidation every 10 seconds
+    syncCheck: 2000,            // Check sync workers every 2 seconds
+    cleanup: 3600000,           // Clean Redis every 1 hour (default, optional)
   },
-  mainClient: prismaClient, // Required for sync worker creation
+  mainClient: prismaClient,     // Required for sync worker creation
   connection: {
     host: "localhost",
     port: 6379,
@@ -314,7 +321,43 @@ await Block.watch({
 });
 ```
 
+**Automatic Redis Cleanup**: `Block.watch()` includes automatic cleanup to prevent performance degradation from accumulated stale data (failed jobs, orphaned keys, etc.). It runs every hour by default and cleans up:
+- Old failed jobs (older than 1 hour)
+- Stale operation keys for deleted blocks
+- Orphaned Redis metadata (`last_seen`, `block_ttl`)
+- Dead letter queues for non-existent blocks
+
+**Customize cleanup interval** based on your workload:
+```typescript
+// High-throughput apps: every 30 minutes
+intervals: { cleanup: 1800000 }
+
+// Normal workload: every 1 hour (default)
+intervals: { cleanup: 3600000 }
+
+// Disable automatic cleanup
+intervals: { cleanup: 0 }
+```
+
 **Important**: The `mainClient` parameter is crucial for sync worker creation. When `Block.watch()` detects blocks with pending operations, it uses this client to create sync workers that process queued operations and sync them to the main database.
+
+### Block.cleanup()
+
+Manually trigger Redis cleanup (also runs automatically via `Block.watch()`):
+
+```typescript
+// Run immediate cleanup
+const result = await Block.cleanup();
+console.log('Cleaned:', result);
+// { staleOperationKeys: 5, oldFailedJobs: 23, orphanedKeys: 8 }
+```
+
+Useful for:
+- Serverless environments (scheduled via cron)
+- Immediate cleanup when Redis is slow
+- Custom cleanup schedules outside of `Block.watch()`
+
+**📖 For detailed Redis maintenance guide**, see [REDIS-MAINTENANCE.md](./REDIS-MAINTENANCE.md)
 
 ## ⚠️ Known Limitations
 

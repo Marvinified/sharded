@@ -71,6 +71,11 @@ interface WatchOptions<T> {
          * Default: 2000 (2 seconds) for responsive sync operations
          */
         syncCheck?: number
+        /**
+         * Interval in milliseconds to run Redis cleanup
+         * Default: 3600000 (1 hour) - set to 0 to disable cleanup
+         */
+        cleanup?: number
     }
     /**
      * Main Prisma client to use for sync worker creation
@@ -1832,8 +1837,8 @@ export class Block {
                 defaultJobOptions: {
                     removeOnComplete: true,
                     removeOnFail: {
-                        count: 1000,
-                        age: 24 * 3600, // keep up to 24 hours
+                        count: 50, // Reduced from 1000 to prevent Redis bloat
+                        age: 3600, // Keep only 1 hour instead of 24 hours
                     },
                     backoff: {
                         type: 'fixed',
@@ -3546,13 +3551,15 @@ export class Block {
      * Start watching processes for block management
      *  - TTL-based invalidation: Checks if blocks haven't been accessed longer than their TTL
      *  - Sync worker management: Creates/destroys sync workers based on pending operations
+     *  - Redis cleanup: Automatically cleans up stale data to prevent performance degradation
      * 
      * @param options
      * Watcher options:
      *  - ttl: in seconds, The default ttl for all blocks
      *  - intervals: Object containing interval configurations
      *    - invalidation: in milliseconds, TTL invalidation checks (default: 10000ms)
-     *    - syncWorkers: in milliseconds, sync worker management (default: 2000ms)
+     *    - syncCheck: in milliseconds, sync worker management (default: 2000ms)
+     *    - cleanup: in milliseconds, Redis cleanup interval (default: 3600000ms = 1 hour, set to 0 to disable)
      *  - mainClient: Main Prisma client for sync worker creation
      *  - connection: The connection options for Redis
      *  */
@@ -3587,6 +3594,20 @@ export class Block {
             },
         })
 
+        const cleanupQueue = new Queue('redis-cleanup', {
+            connection: options.connection ?? {
+                host: process.env.REDIS_HOST ?? 'localhost',
+                port: process.env.REDIS_PORT
+                    ? parseInt(process.env.REDIS_PORT)
+                    : 6379,
+                password: process.env.REDIS_PASSWORD,
+                retryStrategy: function (times: number) {
+                    return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                },
+                enableOfflineQueue: false,
+            },
+        })
+
 
         invalidationQueue.on("error", (error) => {
             console.error(`[sharded][watch] Unhandled error block invalidation queue: ${invalidationQueue.name}`, error);
@@ -3596,8 +3617,13 @@ export class Block {
             console.error(`[sharded][watch] Unhandled error sync worker queue: ${syncQueue.name}`, error);
         });
 
+        cleanupQueue.on("error", (error) => {
+            console.error(`[sharded][watch] Unhandled error cleanup queue: ${cleanupQueue.name}`, error);
+        });
+
         await invalidationQueue.waitUntilReady()
         await syncQueue.waitUntilReady()
+        await cleanupQueue.waitUntilReady()
 
         // Schedule invalidation checks (default: every 10 seconds)
         await invalidationQueue.upsertJobScheduler("check-invalidation-every", {
@@ -3616,6 +3642,17 @@ export class Block {
             name: "check-sync-workers-every",
             data: {},
         })
+
+        // Schedule Redis cleanup (default: every 1 hour, can be disabled by setting to 0)
+        const cleanupInterval = options.intervals?.cleanup ?? 3600000 // 1 hour default
+        if (cleanupInterval > 0) {
+            await cleanupQueue.upsertJobScheduler("cleanup-redis-every", {
+                every: cleanupInterval,
+            }, {
+                name: "cleanup-redis-every",
+                data: {},
+            })
+        }
 
 
 
@@ -3791,9 +3828,157 @@ export class Block {
             },
         })
 
+        // Worker for Redis cleanup (runs at configured interval, default: every 1 hour)
+        if (cleanupInterval > 0) {
+            new Worker(cleanupQueue.name, async (job: Job) => {
+                if (Block.debug) {
+                    console.log('[Sharded] Running Redis cleanup')
+                }
+
+                try {
+                    const result = await Block.cleanup()
+                    if (Block.debug) {
+                        console.log('[Sharded] Cleanup completed:', result)
+                    }
+                } catch (err) {
+                    console.error('[Sharded] Error during scheduled cleanup:', err)
+                }
+            }, {
+                connection: options.connection ?? {
+                    host: process.env.REDIS_HOST ?? 'localhost',
+                    port: process.env.REDIS_PORT
+                        ? parseInt(process.env.REDIS_PORT)
+                        : 6379,
+                    password: process.env.REDIS_PASSWORD,
+                    retryStrategy: function (times: number) {
+                        return Math.max(Math.min(Math.exp(times), 20000), 1000);
+                    },
+                    maxRetriesPerRequest: null,
+                    enableOfflineQueue: true,
+                },
+            })
+        }
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] watch: ${duration.toFixed(2)}ms`)
         }
+    }
+
+    /**
+     * Cleanup stale Redis data to prevent performance degradation
+     * This is automatically called by Block.watch() every hour (configurable).
+     * Can also be called manually for immediate cleanup or in serverless environments.
+     */
+    static async cleanup() {
+        if (!Block.redis) {
+            console.warn('[Sharded] Redis not initialized, skipping cleanup')
+            return
+        }
+
+        const startTime = Date.now()
+        let cleaned = {
+            staleOperationKeys: 0,
+            oldFailedJobs: 0,
+            orphanedKeys: 0,
+        }
+
+        try {
+            // 1. Clean up stale block_operations keys (older than 1 hour with no activity)
+            const operationKeys = await Block.redis.keys('block_operations:*')
+            for (const key of operationKeys) {
+                const queueLength = await Block.redis.llen(key)
+                // If queue is empty, check if block still exists
+                if (queueLength === 0) {
+                    const blockId = key.replace('block_operations:', '')
+                    if (!Block.blockClients.has(blockId)) {
+                        await Block.redis.del(key)
+                        cleaned.staleOperationKeys++
+                    }
+                }
+            }
+
+            // 2. Clean up dead letter queues for non-existent blocks
+            const deadLetterKeys = await Block.redis.keys('block_operations:*:dead_letter')
+            for (const key of deadLetterKeys) {
+                const blockId = key.replace('block_operations:', '').replace(':dead_letter', '')
+                if (!Block.blockClients.has(blockId)) {
+                    await Block.redis.del(key)
+                    cleaned.orphanedKeys++
+                }
+            }
+
+            // 3. Clean old failed jobs from all queues
+            for (const [blockId, queue] of Block.blockQueues.entries()) {
+                try {
+                    // Remove failed jobs older than 1 hour (configurable)
+                    const failed = await queue.getFailed(0, 100)
+                    const oneHourAgo = Date.now() - 3600000
+                    
+                    for (const job of failed) {
+                        if (job.finishedOn && job.finishedOn < oneHourAgo) {
+                            await job.remove()
+                            cleaned.oldFailedJobs++
+                        }
+                    }
+                    
+                    // Also clean completed jobs if any slipped through
+                    const completed = await queue.getCompleted(0, 100)
+                    for (const job of completed) {
+                        await job.remove()
+                    }
+                } catch (err) {
+                    console.error(`[Sharded] Error cleaning queue ${blockId}:`, err)
+                }
+            }
+
+            // 4. Clean up orphaned last_seen and block_ttl entries
+            const lastSeenEntries = await Block.redis.hgetall('last_seen')
+            const blockTtlEntries = await Block.redis.hgetall('block_ttl')
+            
+            for (const blockId in lastSeenEntries) {
+                if (!Block.blockClients.has(blockId)) {
+                    await Block.redis.hdel('last_seen', blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId in blockTtlEntries) {
+                if (!Block.blockClients.has(blockId)) {
+                    await Block.redis.hdel('block_ttl', blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+
+            const duration = Date.now() - startTime
+            console.log(`[Sharded] Cleanup completed in ${duration}ms:`, cleaned)
+            
+            return cleaned
+        } catch (err) {
+            console.error('[Sharded] Error during cleanup:', err)
+            throw err
+        }
+    }
+
+    /**
+     * Start automatic periodic cleanup
+     * @param intervalMs Cleanup interval in milliseconds (default: 1 hour)
+     */
+    static startPeriodicCleanup(intervalMs: number = 3600000) {
+        if (Block.debug) {
+            console.log(`[Sharded] Starting periodic cleanup every ${intervalMs}ms`)
+        }
+        
+        // Run cleanup immediately
+        Block.cleanup().catch(err => {
+            console.error('[Sharded] Initial cleanup failed:', err)
+        })
+        
+        // Then run periodically
+        return setInterval(() => {
+            Block.cleanup().catch(err => {
+                console.error('[Sharded] Periodic cleanup failed:', err)
+            })
+        }, intervalMs)
     }
 }
