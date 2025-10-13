@@ -1592,26 +1592,41 @@ export class Block {
      */
     static async waitForBlockReady(blockId: string): Promise<void> {
         const startTime = Block.perfDebug ? performance.now() : 0
+        
         // Fast path: check in-process locks first (no Redis call needed)
-        if (Block.locks.has(blockId)) {
+        const lockCheckStart = Block.perfDebug ? performance.now() : 0
+        const hasLock = Block.locks.has(blockId)
+        if (Block.perfDebug) {
+            console.log(`⏱️  [PERF][waitForBlockReady] locks.has check: ${(performance.now() - lockCheckStart).toFixed(2)}ms`)
+        }
+        
+        if (hasLock) {
+            const lockWaitStart = Block.perfDebug ? performance.now() : 0
             await Block.locks.get(blockId)
+            if (Block.perfDebug) {
+                console.log(`⏱️  [PERF][waitForBlockReady] await in-process lock: ${(performance.now() - lockWaitStart).toFixed(2)}ms`)
+            }
             
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
-                console.log(`⏱️  [PERF] waitForBlockReady (in-process lock): ${duration.toFixed(2)}ms`)
+                console.log(`⏱️  [PERF][waitForBlockReady] TOTAL (in-process lock): ${duration.toFixed(2)}ms`)
             }
             return
         }
 
         // Check cached lock status
+        const cacheCheckStart = Block.perfDebug ? performance.now() : 0
         const cached = Block.lockStatusCache.get(blockId)
         const now = Date.now()
+        if (Block.perfDebug) {
+            console.log(`⏱️  [PERF][waitForBlockReady] cache check: ${(performance.now() - cacheCheckStart).toFixed(2)}ms`)
+        }
 
         if (cached && (now - cached.lastChecked) < Block.LOCK_CACHE_TTL) {
             if (!cached.isLocked) {
                 if (Block.perfDebug) {
                     const duration = performance.now() - startTime
-                    console.log(`⏱️  [PERF] waitForBlockReady (cached): ${duration.toFixed(2)}ms`)
+                    console.log(`⏱️  [PERF][waitForBlockReady] TOTAL (cached): ${duration.toFixed(2)}ms`)
                 }
                 return // Cache says no lock, proceed immediately
             }
@@ -1619,18 +1634,26 @@ export class Block {
 
         // Check for Redis block lock (master creation or reload)
         const blockLockKey = `block_lock:${blockId}`
+        const redisCheckStart = Block.perfDebug ? performance.now() : 0
         const blockLockExists = await Block.redis?.exists(blockLockKey)
+        if (Block.perfDebug) {
+            console.log(`⏱️  [PERF][waitForBlockReady] redis.exists: ${(performance.now() - redisCheckStart).toFixed(2)}ms`)
+        }
 
         // Update cache
+        const cacheUpdateStart = Block.perfDebug ? performance.now() : 0
         Block.lockStatusCache.set(blockId, {
             isLocked: !!blockLockExists,
             lastChecked: now
         })
+        if (Block.perfDebug) {
+            console.log(`⏱️  [PERF][waitForBlockReady] cache update: ${(performance.now() - cacheUpdateStart).toFixed(2)}ms`)
+        }
 
         if (!blockLockExists) {
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
-                console.log(`⏱️  [PERF] waitForBlockReady (no lock): ${duration.toFixed(2)}ms`)
+                console.log(`⏱️  [PERF][waitForBlockReady] TOTAL (no lock): ${duration.toFixed(2)}ms`)
             }
             return // Block is ready for operations
         }
@@ -1639,18 +1662,33 @@ export class Block {
         const maxWaitTime = 30000
         const waitStartTime = Date.now()
         let backoffDelay = 100
+        let waitIterations = 0
+
+        if (Block.perfDebug) {
+            console.log(`⏱️  [PERF][waitForBlockReady] entering wait loop, lock exists`)
+        }
 
         while (Date.now() - waitStartTime < maxWaitTime) {
             if (Block.debug) {
                 console.log(`[Sharded] Waiting for block operation (master creation/reload) to complete for block ${blockId}`)
             }
 
+            const sleepStart = Block.perfDebug ? performance.now() : 0
             await new Promise(resolve => setTimeout(resolve, backoffDelay))
+            if (Block.perfDebug) {
+                console.log(`⏱️  [PERF][waitForBlockReady] sleep(${backoffDelay}ms): ${(performance.now() - sleepStart).toFixed(2)}ms`)
+            }
 
             // Exponential backoff up to 1 second
             backoffDelay = Math.min(backoffDelay * 1.5, 1000)
+            waitIterations++
 
+            const redisRecheckStart = Block.perfDebug ? performance.now() : 0
             const blockLockExists = await Block.redis?.exists(blockLockKey)
+            if (Block.perfDebug) {
+                console.log(`⏱️  [PERF][waitForBlockReady] redis.exists (iteration ${waitIterations}): ${(performance.now() - redisRecheckStart).toFixed(2)}ms`)
+            }
+            
             Block.lockStatusCache.set(blockId, {
                 isLocked: !!blockLockExists,
                 lastChecked: Date.now()
@@ -1659,7 +1697,7 @@ export class Block {
             if (!blockLockExists && !Block.locks.has(blockId)) {
                 if (Block.perfDebug) {
                     const duration = performance.now() - startTime
-                    console.log(`⏱️  [PERF] waitForBlockReady (waited): ${duration.toFixed(2)}ms`)
+                    console.log(`⏱️  [PERF][waitForBlockReady] TOTAL (waited ${waitIterations} iterations): ${duration.toFixed(2)}ms`)
                 }
                 return // Block is ready for operations
             }
@@ -2176,15 +2214,24 @@ export class Block {
         try {
             // Queue individual operation in Redis list
             const operationQueueKey = `block_operations:${blockId}`
+            
+            const stringifyStart = Block.perfDebug ? performance.now() : 0
             const operationData = JSON.stringify({
                 operation,
                 model,
                 args,
                 queued_at: Date.now(),
             })
+            if (Block.perfDebug) {
+                console.log(`⏱️  [PERF][queue_operation] JSON.stringify: ${(performance.now() - stringifyStart).toFixed(2)}ms`)
+            }
 
             // Add to the end of the list (FIFO order)
+            const rpushStart = Block.perfDebug ? performance.now() : 0
             await Block.redis.rpush(operationQueueKey, operationData)
+            if (Block.perfDebug) {
+                console.log(`⏱️  [PERF][queue_operation] redis.rpush: ${(performance.now() - rpushStart).toFixed(2)}ms`)
+            }
 
             if (Block.debug) {
                 console.log('🔄 Queued operation in Redis:', { operation, model, args })
@@ -2193,18 +2240,36 @@ export class Block {
             // Trigger immediate batch processing if this is a new operation queue
             // or if there might be a delay in processing
             try {
+                const queueGetStart = Block.perfDebug ? performance.now() : 0
                 const queue = Block.blockQueues.get(blockId)
+                if (Block.perfDebug) {
+                    console.log(`⏱️  [PERF][queue_operation] get queue: ${(performance.now() - queueGetStart).toFixed(2)}ms`)
+                }
+                
                 if (queue) {
                     // Check if there's already a job waiting/processing
+                    const getWaitingStart = Block.perfDebug ? performance.now() : 0
                     const waiting = await queue.getWaiting()
+                    if (Block.perfDebug) {
+                        console.log(`⏱️  [PERF][queue_operation] queue.getWaiting: ${(performance.now() - getWaitingStart).toFixed(2)}ms`)
+                    }
+                    
+                    const getActiveStart = Block.perfDebug ? performance.now() : 0
                     const active = await queue.getActive()
+                    if (Block.perfDebug) {
+                        console.log(`⏱️  [PERF][queue_operation] queue.getActive: ${(performance.now() - getActiveStart).toFixed(2)}ms`)
+                    }
 
                     // If no jobs are pending, trigger immediate processing
                     if (waiting.length === 0 && active.length === 0) {
+                        const addJobStart = Block.perfDebug ? performance.now() : 0
                         await queue.add(`${blockId}_batch_processor`, { blockId }, {
                             delay: 1, // Minimal delay for immediate processing
                             jobId: `${blockId}_trigger_${Date.now()}` // Unique job ID
                         })
+                        if (Block.perfDebug) {
+                            console.log(`⏱️  [PERF][queue_operation] queue.add: ${(performance.now() - addJobStart).toFixed(2)}ms`)
+                        }
 
                         if (Block.debug) {
                             console.log(`🚀 Triggered immediate batch processing for ${blockId}`)
