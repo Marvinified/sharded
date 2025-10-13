@@ -244,171 +244,6 @@ await Block.watch({
 1. **Writes**: Buffered in SQLite → Queued in Redis → Synced to main DB
 2. **Reads**: Check SQLite cache → Fallback to main DB → Cache result
 
-## 📚 API Reference
-
-### Block.create(config)
-
-Creates a new block instance.
-
-```typescript
-interface BlockConfig<T> {
-  blockId: string;                    // Unique identifier for the block
-  client: T;                         // Main Prisma client
-  loader: (blockClient: T, mainClient: T) => Promise<void>; // Data loader function
-  debug?: boolean;                   // Enable debug logging
-  prismaOptions?: Prisma.PrismaClientOptions; // Additional Prisma options
-  connection?: {                     // Redis connection options
-    host: string;
-    port: number;
-    password?: string;
-  };
-  ttl?: number;                      // Cache TTL in seconds (used by watch() for invalidation)
-};
-```
-
-### Block.invalidate(blockId)
-
-Manually invalidate a block cache:
-
-```typescript
-await Block.invalidate("user-orders-cache");
-```
-
-### Block.delete_block(blockId)
-
-Delete a block and its associated files:
-
-```typescript
-await Block.delete_block("user-orders-cache");
-```
-
-### Block.watch(options)
-
-Start watching for cache invalidation, sync worker management, and automatic Redis cleanup.
-
-**Interface:**
-```typescript
-interface WatchOptions<T> {
-  ttl?: number;                  // Default TTL in seconds for all blocks
-  intervals?: {
-    invalidation?: number;       // Check TTL invalidation (ms, default: 10000)
-    syncCheck?: number;          // Check sync workers (ms, default: 2000)
-    cleanup?: number;            // Redis cleanup (ms, default: 3600000, set 0 to disable)
-  };
-  mainClient: T;                 // Required: Main Prisma client for sync worker creation
-  connection?: {                 // Redis connection options
-    host: string;
-    port: number;
-    password?: string;
-  };
-}
-```
-
-**Example:**
-```typescript
-await Block.watch({
-  ttl: 3600,                    // Cache TTL in seconds
-  intervals: {
-    invalidation: 10000,        // Check TTL invalidation every 10 seconds
-    syncCheck: 2000,            // Check sync workers every 2 seconds
-    cleanup: 3600000,           // Clean Redis every 1 hour (default, optional)
-  },
-  mainClient: prismaClient,     // Required for sync worker creation
-  connection: {
-    host: "localhost",
-    port: 6379,
-  },
-});
-```
-
-**Automatic Redis Cleanup**: `Block.watch()` includes automatic cleanup to prevent performance degradation from accumulated stale data (failed jobs, orphaned keys, etc.). It runs every hour by default and cleans up:
-- Old failed jobs (older than 1 hour)
-- Stale operation keys for deleted blocks
-- Orphaned Redis metadata (`last_seen`, `block_ttl`)
-- Dead letter queues for non-existent blocks
-
-**Customize cleanup interval** based on your workload:
-```typescript
-// High-throughput apps: every 30 minutes
-intervals: { cleanup: 1800000 }
-
-// Normal workload: every 1 hour (default)
-intervals: { cleanup: 3600000 }
-
-// Disable automatic cleanup
-intervals: { cleanup: 0 }
-```
-
-**Important**: The `mainClient` parameter is crucial for sync worker creation. When `Block.watch()` detects blocks with pending operations, it uses this client to create sync workers that process queued operations and sync them to the main database.
-
-### Block.cleanup()
-
-Manually trigger Redis cleanup (also runs automatically via `Block.watch()`):
-
-```typescript
-// Run immediate cleanup
-const result = await Block.cleanup();
-console.log('Cleaned:', result);
-// { staleOperationKeys: 5, oldFailedJobs: 23, orphanedKeys: 8 }
-```
-
-Useful for:
-- Serverless environments (scheduled via cron)
-- Immediate cleanup when Redis is slow
-- Custom cleanup schedules outside of `Block.watch()`
-
-**📖 For detailed Redis maintenance guide**, see [REDIS-MAINTENANCE.md](./REDIS-MAINTENANCE.md)
-
-## ⚠️ Known Limitations
-
-- **Cache Consistency**: If records are modified directly in the main database, the block cache won't be aware until invalidation
-
-## 📋 TODO
-
-- **Multi-Machine Sync**: Currently, blocks with the same ID across different machines don't sync with each other. Multi-process on the same machine works fine as they share the same SQLite file location, but cross-machine block synchronization needs to be implemented.
-
-## 🧪 Testing
-
-```bash
-# Run tests
-yarn test
-
-# Run in development mode
-yarn dev
-```
-
-## 📁 Project Structure
-
-```
-sharded/
-├── cli/                 # Command-line interface
-│   ├── generate.ts     # Schema generation
-│   └── index.ts        # CLI entry point
-├── runtime/            # Core runtime
-│   └── Block.ts        # Main Block class
-├── tests/              # Test files
-├── prisma/             # Example schema
-└── dist/               # Compiled output
-```
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit your changes: `git commit -m 'Add amazing feature'`
-4. Push to the branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🔗 Links
-
-- [npm package](https://www.npmjs.com/package/sharded)
-- [GitHub repository](https://github.com/your-username/sharded)
-- [Issues](https://github.com/your-username/sharded/issues)
-
 ## 💡 Use Cases
 
 - **High-traffic applications** requiring fast read access
@@ -622,6 +457,174 @@ await userBlock.activity.create({ ... });
 // Clean up when session ends
 await Block.delete_block(`user-${userId}-${sessionId}`);
 ```
+
+## 📚 API Reference
+
+### Block.create(config)
+
+Creates a new block instance.
+
+```typescript
+interface BlockConfig<T> {
+  blockId: string;                    // Unique identifier for the block
+  client: T;                         // Main Prisma client
+  loader: (blockClient: T, mainClient: T) => Promise<void>; // Data loader function
+  debug?: boolean;                   // Enable debug logging
+  prismaOptions?: Prisma.PrismaClientOptions; // Additional Prisma options
+  connection?: {                     // Redis connection options
+    host: string;
+    port: number;
+    password?: string;
+  };
+  ttl?: number;                      // Cache TTL in seconds (used by watch() for invalidation)
+};
+```
+
+### Block.invalidate(blockId)
+
+Manually invalidate a block cache:
+
+```typescript
+await Block.invalidate("user-orders-cache");
+```
+
+### Block.delete_block(blockId)
+
+Delete a block and its associated files:
+
+```typescript
+await Block.delete_block("user-orders-cache");
+```
+
+### Block.watch(options)
+
+Start watching for cache invalidation, sync worker management, and automatic Redis cleanup.
+
+**Interface:**
+```typescript
+interface WatchOptions<T> {
+  ttl?: number;                  // Default TTL in seconds for all blocks
+  intervals?: {
+    invalidation?: number;       // Check TTL invalidation (ms, default: 10000)
+    syncCheck?: number;          // Check sync workers (ms, default: 2000)
+    cleanup?: number;            // Redis cleanup (ms, default: 3600000, set 0 to disable)
+  };
+  mainClient: T;                 // Required: Main Prisma client for sync worker creation
+  connection?: {                 // Redis connection options
+    host: string;
+    port: number;
+    password?: string;
+  };
+}
+```
+
+**Example:**
+```typescript
+await Block.watch({
+  ttl: 3600,                    // Cache TTL in seconds
+  intervals: {
+    invalidation: 10000,        // Check TTL invalidation every 10 seconds
+    syncCheck: 2000,            // Check sync workers every 2 seconds
+    cleanup: 3600000,           // Clean Redis every 1 hour (default, optional)
+  },
+  mainClient: prismaClient,     // Required for sync worker creation
+  connection: {
+    host: "localhost",
+    port: 6379,
+  },
+});
+```
+
+**Automatic Redis Cleanup**: `Block.watch()` includes automatic cleanup to prevent performance degradation from accumulated stale data (failed jobs, orphaned keys, etc.). It runs every hour by default and cleans up:
+- Old failed jobs (older than 1 hour)
+- Stale operation keys for deleted blocks
+- Orphaned Redis metadata (`last_seen`, `block_ttl`)
+- Dead letter queues for non-existent blocks
+
+**Customize cleanup interval** based on your workload:
+```typescript
+// High-throughput apps: every 30 minutes
+intervals: { cleanup: 1800000 }
+
+// Normal workload: every 1 hour (default)
+intervals: { cleanup: 3600000 }
+
+// Disable automatic cleanup
+intervals: { cleanup: 0 }
+```
+
+**Important**: The `mainClient` parameter is crucial for sync worker creation. When `Block.watch()` detects blocks with pending operations, it uses this client to create sync workers that process queued operations and sync them to the main database.
+
+### Block.cleanup()
+
+Manually trigger Redis cleanup (also runs automatically via `Block.watch()`):
+
+```typescript
+// Run immediate cleanup
+const result = await Block.cleanup();
+console.log('Cleaned:', result);
+// { staleOperationKeys: 5, oldFailedJobs: 23, orphanedKeys: 8 }
+```
+
+Useful for:
+- Serverless environments (scheduled via cron)
+- Immediate cleanup when Redis is slow
+- Custom cleanup schedules outside of `Block.watch()`
+
+**📖 For detailed Redis maintenance guide**, see [REDIS-MAINTENANCE.md](./REDIS-MAINTENANCE.md)
+
+## ⚠️ Known Limitations
+
+- **Cache Consistency**: If records are modified directly in the main database, the block cache won't be aware until invalidation
+
+
+## 📋 TODO
+
+- **Multi-Machine Sync**: Currently, blocks with the same ID across different machines don't sync with each other. Multi-process on the same machine works fine as they share the same SQLite file location, but cross-machine block synchronization needs to be implemented.
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/amazing-feature`
+3. Commit your changes: `git commit -m 'Add amazing feature'`
+4. Push to the branch: `git push origin feature/amazing-feature`
+5. Open a Pull Request
+
+
+## 🧪 Testing
+
+```bash
+# Run tests
+yarn test
+
+# Run in development mode
+yarn dev
+```
+
+## 📁 Project Structure
+
+```
+sharded/
+├── cli/                 # Command-line interface
+│   ├── generate.ts     # Schema generation
+│   └── index.ts        # CLI entry point
+├── runtime/            # Core runtime
+│   └── Block.ts        # Main Block class
+├── tests/              # Test files
+├── prisma/             # Example schema
+└── dist/               # Compiled output
+```
+
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🔗 Links
+
+- [npm package](https://www.npmjs.com/package/sharded)
+- [GitHub repository](https://github.com/marvinified/sharded)
+- [Issues](https://github.com/marvinified/sharded/issues)
 
 ---
 
