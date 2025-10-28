@@ -105,6 +105,8 @@ export class Block {
     private static activeWriteOperations = new Map<string, number>()
     // Track blocks currently being invalidated
     private static invalidatingBlocks = new Set<string>()
+    // Track blocks that should skip WAL checkpointing (invalidated or have disk errors)
+    private static skipCheckpointBlocks = new Set<string>()
     // Store loader functions for each block
     private static blockLoaders = new Map<string, (blockClient: any, mainClient: any) => Promise<void>>()
     // Track last update time to avoid excessive Redis calls
@@ -355,9 +357,21 @@ export class Block {
      */
     static async forceWalCheckpoint(blockId: string, mode: 'PASSIVE' | 'FULL' | 'RESTART' | 'TRUNCATE' = 'FULL'): Promise<any> {
         const startTime = Block.perfDebug ? performance.now() : 0
+        
+        // Skip blocks that are marked for no checkpointing
+        if (Block.skipCheckpointBlocks.has(blockId)) {
+            if (Block.debug) {
+                console.log(`[Sharded] Block ${blockId} is marked to skip checkpointing`)
+            }
+            return null
+        }
+        
         const blockClient = Block.blockClients.get(blockId)
         if (!blockClient) {
-            throw new Error(`Block client not found for ${blockId}`)
+            if (Block.debug) {
+                console.log(`[Sharded] Block client not found for ${blockId}, skipping WAL checkpoint`)
+            }
+            return null
         }
 
         try {
@@ -381,7 +395,25 @@ export class Block {
             }
             
             return returnValue
-        } catch (err) {
+        } catch (err: any) {
+            // Handle disk I/O errors gracefully - likely the block was invalidated/deleted
+            const isDiskIOError = err?.code === 'P2010' && 
+                                 (err?.meta?.code === '1802' || err?.meta?.message?.includes('disk I/O error'))
+            const isNotFoundError = err?.meta?.message?.includes('unable to open database') ||
+                                   err?.meta?.message?.includes('no such table')
+            
+            if (isDiskIOError || isNotFoundError) {
+                if (Block.debug) {
+                    console.log(`[Sharded] Database file not accessible for ${blockId}, likely invalidated - stopping all checkpoints for this block`)
+                }
+                // Mark this block to skip future checkpoints
+                Block.skipCheckpointBlocks.add(blockId)
+                // DO NOT remove client here - let invalidation handle proper cleanup
+                // Removing client here can prevent proper WAL recovery and cause data loss
+                return null
+            }
+            
+            // For other errors, log and re-throw
             console.error(`[Sharded] WAL checkpoint failed for ${blockId}:`, err)
             throw err
         }
@@ -404,21 +436,35 @@ export class Block {
 
                     for (const blockId of blockIds) {
                         try {
+                            // Skip blocks marked for no checkpointing
+                            if (Block.skipCheckpointBlocks.has(blockId)) {
+                                continue
+                            }
+
+                            // Check if block still exists before checkpointing
+                            // (it may have been invalidated during iteration)
+                            if (!Block.blockClients.has(blockId)) {
+                                continue
+                            }
+
                             // Perform passive checkpoint to avoid blocking operations
                             const result = await Block.forceWalCheckpoint(blockId, 'PASSIVE')
 
-                            if (result.result.busy > 0) {
+                            if (result && result.result.busy > 0) {
                                 if (Block.debug) {
                                     console.log(`[Sharded] WAL checkpoint busy for ${blockId}, readers may be holding old snapshots`)
                                 }
                             }
 
                             // If checkpoint shows significant WAL size, try a more aggressive checkpoint
-                            if (result.result.log > 10000) { // More than 10k pages
+                            if (result && result.result.log > 10000) { // More than 10k pages
                                 if (Block.debug) {
                                     console.log(`[Sharded] Large WAL detected for ${blockId} (${result.result.log} pages), attempting FULL checkpoint`)
                                 }
-                                await Block.forceWalCheckpoint(blockId, 'FULL')
+                                // Check again before the second checkpoint
+                                if (Block.blockClients.has(blockId)) {
+                                    await Block.forceWalCheckpoint(blockId, 'FULL')
+                                }
                             }
 
                         } catch (err) {
@@ -482,6 +528,16 @@ export class Block {
                     // Auto-recovery for common issues
                     for (const [blockId, blockData] of Object.entries(healthStatus.blocks)) {
                         const data = blockData as any
+
+                        // Skip blocks marked for no checkpointing
+                        if (Block.skipCheckpointBlocks.has(blockId)) {
+                            continue
+                        }
+
+                        // Check if block still exists before attempting recovery
+                        if (!Block.blockClients.has(blockId)) {
+                            continue
+                        }
 
                         // Handle busy readers automatically
                         if (data.warnings?.some((w: string) => w.includes('Busy readers'))) {
@@ -1115,6 +1171,29 @@ export class Block {
             // Create buffer database path
             const blockPath = join(dataDir, `${config.blockId}.sqlite`)
             let needsInitialLoad = !existsSync(blockPath)
+            
+            // Check if existing file is corrupted (0 bytes or invalid)
+            if (!needsInitialLoad && existsSync(blockPath)) {
+                const fs = require('fs')
+                const stats = fs.statSync(blockPath)
+                if (stats.size === 0) {
+                    console.warn(`[Sharded] Detected corrupted/empty block file: ${blockPath}, will recreate from template`)
+                    // Delete corrupted file and associated WAL files
+                    try {
+                        const suffixes = ['', '-shm', '-wal']
+                        suffixes.forEach(suffix => {
+                            const filePath = blockPath + suffix
+                            if (existsSync(filePath)) {
+                                unlinkSync(filePath)
+                            }
+                        })
+                        needsInitialLoad = true
+                    } catch (err) {
+                        console.error(`[Sharded] Failed to delete corrupted block file: ${blockPath}`, err)
+                        throw err
+                    }
+                }
+            }
 
             let redisLockAcquired = false
             let blockLockKey = ''
@@ -1152,6 +1231,17 @@ export class Block {
                         console.log('[Sharded] Creating SQLite file from template:', blockPath)
                     }
                     copyFileSync(templatePath, blockPath)
+                    
+                    // Verify the copy was successful
+                    const fs = require('fs')
+                    const copiedStats = fs.statSync(blockPath)
+                    const templateStats = fs.statSync(templatePath)
+                    if (copiedStats.size === 0 || copiedStats.size !== templateStats.size) {
+                        throw new Error(`Failed to copy template database: copied file size (${copiedStats.size}) doesn't match template (${templateStats.size})`)
+                    }
+                    if (Block.debug) {
+                        console.log(`[Sharded] Successfully copied template (${templateStats.size} bytes) to ${blockPath}`)
+                    }
                 } else {
                     if (Block.debug) {
                         console.log('[Sharded] SQLite file was created by another process while waiting for lock:', blockPath)
@@ -1168,6 +1258,8 @@ export class Block {
 
             // Use absolute path to ensure all processes connect to the same file
             const absoluteBlockPath = require('path').resolve(blockPath)
+            // Note: Using mode=rwc (read-write-create) to allow WAL mode initialization
+            // File should already exist from template copy above
             const connectionUrl = `file:${absoluteBlockPath}?mode=rwc&cache=private`
 
             const blockClient = new BlockPrismaClient({
@@ -1264,6 +1356,9 @@ export class Block {
                 console.log('[Sharded] Created block:', config.blockId)
             }
 
+            // Remove from checkpoint skip list since this is a fresh/recreated block
+            Block.skipCheckpointBlocks.delete(config.blockId)
+
             // Start WAL maintenance and health monitoring automatically for first block
             if (Block.blockClients.size === 1) {
                 if (Block.walMaintenanceEnabled && !Block.walMaintenanceInterval) {
@@ -1327,6 +1422,8 @@ export class Block {
         }
 
         const operationQueueKey = `block_operations:${blockId}`
+        const waitStartTime = Date.now()
+        let lastLogTime = 0
 
         while (true) {
             const pendingCount = await Block.redis.llen(operationQueueKey)
@@ -1338,14 +1435,15 @@ export class Block {
                 break
             }
 
-            if (Block.debug) {
-                console.log(`[Sharded] Waiting for ${pendingCount} pending syncs for block ${blockId}, (operationKey: ${operationQueueKey})`)
+            // Log every 5 seconds to reduce noise but provide visibility
+            const elapsed = Date.now() - waitStartTime
+            if (Block.debug && elapsed - lastLogTime > 5000) {
+                console.log(`[Sharded] Waiting for ${pendingCount} pending syncs for block ${blockId} (${elapsed}ms elapsed)`)
+                lastLogTime = elapsed
             }
 
             await new Promise(resolve => setTimeout(resolve, 100))
         }
-
-        console.warn(`[Sharded] Timeout waiting for pending syncs for block ${blockId}`)
         
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
@@ -2412,11 +2510,19 @@ export class Block {
         try {
             console.log('[Sharded] Performing final WAL checkpoints...')
             const blockIds = Array.from(Block.blockClients.keys())
-            await Promise.all(blockIds.map(blockId =>
-                Block.forceWalCheckpoint(blockId, 'FULL').catch(err => {
+            await Promise.all(blockIds.map(async blockId => {
+                // Skip blocks marked for no checkpointing
+                if (Block.skipCheckpointBlocks.has(blockId)) {
+                    return
+                }
+                // Check if block still exists before checkpointing
+                if (!Block.blockClients.has(blockId)) {
+                    return
+                }
+                return Block.forceWalCheckpoint(blockId, 'FULL').catch(err => {
                     console.error(`[Sharded] Final checkpoint failed for ${blockId}:`, err)
                 })
-            ))
+            }))
         } catch (err) {
             console.error('[Sharded] Error during final WAL checkpoints:', err)
         }
@@ -3190,6 +3296,8 @@ export class Block {
         }
 
         Block.invalidatingBlocks.add(blockId)
+        // Stop all WAL checkpointing for this block immediately
+        Block.skipCheckpointBlocks.add(blockId)
 
         try {
             // First, wait for ongoing operations to complete WITHOUT holding any locks
