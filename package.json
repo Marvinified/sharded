@@ -1,6 +1,6 @@
 {
   "name": "sharded",
-  "version": "0.0.46",
+  "version": "0.0.47",
   "description": "SQLite-based write buffer and caching system for Prisma",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
