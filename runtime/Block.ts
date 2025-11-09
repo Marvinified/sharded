@@ -283,7 +283,7 @@ export class Block {
             }
 
             console.log(`[Sharded] ✓ Database path verified for ${blockId}: ${expectedPath}`)
-            
+
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
                 console.log(`⏱️  [PERF] verifyDatabasePath: ${duration.toFixed(2)}ms`)
@@ -338,7 +338,7 @@ export class Block {
                     checkpointed: (walCheckpoint as any[])[0]?.checkpointed
                 }
             }
-            
+
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
                 console.log(`⏱️  [PERF] getWalDiagnostics: ${duration.toFixed(2)}ms`)
@@ -357,7 +357,7 @@ export class Block {
      */
     static async forceWalCheckpoint(blockId: string, mode: 'PASSIVE' | 'FULL' | 'RESTART' | 'TRUNCATE' = 'FULL'): Promise<any> {
         const startTime = Block.perfDebug ? performance.now() : 0
-        
+
         // Skip blocks that are marked for no checkpointing
         if (Block.skipCheckpointBlocks.has(blockId)) {
             if (Block.debug) {
@@ -365,7 +365,7 @@ export class Block {
             }
             return null
         }
-        
+
         const blockClient = Block.blockClients.get(blockId)
         if (!blockClient) {
             if (Block.debug) {
@@ -388,20 +388,20 @@ export class Block {
                 result: (result as any[])[0],
                 timestamp: new Date().toISOString()
             }
-            
+
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
                 console.log(`⏱️  [PERF] forceWalCheckpoint (${mode}): ${duration.toFixed(2)}ms`)
             }
-            
+
             return returnValue
         } catch (err: any) {
             // Handle disk I/O errors gracefully - likely the block was invalidated/deleted
-            const isDiskIOError = err?.code === 'P2010' && 
-                                 (err?.meta?.code === '1802' || err?.meta?.message?.includes('disk I/O error'))
+            const isDiskIOError = err?.code === 'P2010' &&
+                (err?.meta?.code === '1802' || err?.meta?.message?.includes('disk I/O error'))
             const isNotFoundError = err?.meta?.message?.includes('unable to open database') ||
-                                   err?.meta?.message?.includes('no such table')
-            
+                err?.meta?.message?.includes('no such table')
+
             if (isDiskIOError || isNotFoundError) {
                 if (Block.debug) {
                     console.log(`[Sharded] Database file not accessible for ${blockId}, likely invalidated - stopping all checkpoints for this block`)
@@ -412,7 +412,7 @@ export class Block {
                 // Removing client here can prevent proper WAL recovery and cause data loss
                 return null
             }
-            
+
             // For other errors, log and re-throw
             console.error(`[Sharded] WAL checkpoint failed for ${blockId}:`, err)
             throw err
@@ -483,7 +483,7 @@ export class Block {
         if (Block.debug) {
             console.log(`[Sharded] WAL maintenance started with ${intervalMs}ms interval`)
         }
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] startWalMaintenance: ${duration.toFixed(2)}ms`)
@@ -1065,7 +1065,7 @@ export class Block {
      * Update last seen time for a block, but throttled to avoid excessive Redis calls
      */
     static updateLastSeenThrottled(blockId: string) {
-        const startTime = Block.perfDebug ? performance.now() : 0 
+        const startTime = Block.perfDebug ? performance.now() : 0
         const now = Date.now()
         const lastUpdate = Block.lastSeenUpdateTimes.get(blockId) || 0
 
@@ -1141,15 +1141,23 @@ export class Block {
                 console.log('[Sharded] Locking creation of block:', config.blockId)
             }
             let lockResolve: (() => void) | undefined
+            if (Block.debug) {
+                console.log(`[Sharded] Setting lock for block ${config.blockId}`)
+            }
             Block.locks.set(config.blockId, new Promise(resolve => {
                 lockResolve = resolve
             }))
 
-            if (Block.debug) {
-                console.log('[Sharded] Creating new block:', config.blockId)
-            }
-            const baseDir = join(process.cwd(), 'prisma', 'blocks')
-            const dataDir = join(baseDir, 'data')
+            // Declare these variables in outer scope so they're accessible in finally block
+            let redisLockAcquired = false
+            let blockLockKey = ''
+
+            try {
+                if (Block.debug) {
+                    console.log('[Sharded] Creating new block:', config.blockId)
+                }
+                const baseDir = join(process.cwd(), 'prisma', 'blocks')
+                const dataDir = join(baseDir, 'data')
 
             if (!existsSync(dataDir)) {
                 mkdirSync(dataDir, { recursive: true })
@@ -1171,7 +1179,7 @@ export class Block {
             // Create buffer database path
             const blockPath = join(dataDir, `${config.blockId}.sqlite`)
             let needsInitialLoad = !existsSync(blockPath)
-            
+
             // Check if existing file is corrupted (0 bytes or invalid)
             if (!needsInitialLoad && existsSync(blockPath)) {
                 const fs = require('fs')
@@ -1194,9 +1202,6 @@ export class Block {
                     }
                 }
             }
-
-            let redisLockAcquired = false
-            let blockLockKey = ''
             if (needsInitialLoad) {
                 // Acquire Redis lock only when creating SQLite file to prevent race conditions
                 blockLockKey = `block_lock:${config.blockId}`
@@ -1231,7 +1236,7 @@ export class Block {
                         console.log('[Sharded] Creating SQLite file from template:', blockPath)
                     }
                     copyFileSync(templatePath, blockPath)
-                    
+
                     // Verify the copy was successful
                     const fs = require('fs')
                     const copiedStats = fs.statSync(blockPath)
@@ -1368,21 +1373,22 @@ export class Block {
                     await Block.startWalHealthMonitoring()
                 }
             }
-
-            // Resolve the in-process lock after everything is complete (including loader)
-            if (lockResolve) {
-                Block.locks.delete(config.blockId)
-                if (Block.debug) {
-                    console.log('[Sharded] Unlocking creation of block:', config.blockId)
+            } finally {
+                // Always release the in-process lock, even if creation fails
+                if (lockResolve) {
+                    Block.locks.delete(config.blockId)
+                    if (Block.debug) {
+                        console.log('[Sharded] Unlocking creation of block:', config.blockId)
+                    }
+                    lockResolve()
                 }
-                lockResolve()
-            }
 
-            // Release Redis lock if we acquired it for SQLite file creation
-            if (redisLockAcquired && blockLockKey) {
-                await Block.redis?.del(blockLockKey)
-                if (Block.debug) {
-                    console.log(`[Sharded] Released Redis lock for SQLite file creation: ${config.blockId}`)
+                // Release Redis lock if we acquired it for SQLite file creation
+                if (redisLockAcquired && blockLockKey) {
+                    await Block.redis?.del(blockLockKey)
+                    if (Block.debug) {
+                        console.log(`[Sharded] Released Redis lock for SQLite file creation: ${config.blockId}`)
+                    }
                 }
             }
         }
@@ -1444,7 +1450,7 @@ export class Block {
 
             await new Promise(resolve => setTimeout(resolve, 100))
         }
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] waitForPendingSyncs: ${duration.toFixed(2)}ms`)
@@ -1461,12 +1467,12 @@ export class Block {
             if (block) {
                 // Update last seen before returning
                 Block.updateLastSeenThrottled(blockId)
-                
+
                 if (Block.perfDebug) {
                     const duration = performance.now() - startTime
                     console.log(`⏱️  [PERF] safeGetBlock: ${duration.toFixed(2)}ms`)
                 }
-                
+
                 return block as T
             }
 
@@ -1475,12 +1481,12 @@ export class Block {
                 await new Promise(resolve => setTimeout(resolve, 100))
             }
         }
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] safeGetBlock (failed): ${duration.toFixed(2)}ms`)
         }
-        
+
         return null
     }
 
@@ -1615,6 +1621,9 @@ export class Block {
 
         // Create a lock to prevent concurrent reloads and block creation
         let lockResolve: (() => void) | undefined
+        if (Block.debug) {
+            console.log(`[Sharded] Setting lock for block ${blockId}`)
+        }
         Block.locks.set(blockId, new Promise(resolve => {
             lockResolve = resolve
         }))
@@ -1671,8 +1680,14 @@ export class Block {
             throw err
         } finally {
             // Always release the in-process lock
+            if (Block.debug) {
+                console.log(`[Sharded] Deleting lock for block ${blockId}`)
+            }
             Block.locks.delete(blockId)
             if (lockResolve) {
+                if (Block.debug) {
+                    console.log(`[Sharded] Resolving lock for block ${blockId}`)
+                }
                 lockResolve()
             }
 
@@ -1682,7 +1697,7 @@ export class Block {
             if (Block.debug) {
                 console.log(`[Sharded] Released block lock for ${blockId}`)
             }
-            
+
             if (Block.perfDebug) {
                 const duration = performance.now() - perfStartTime
                 console.log(`⏱️  [PERF] reloadBlockData: ${duration.toFixed(2)}ms`)
@@ -1695,21 +1710,21 @@ export class Block {
      */
     static async waitForBlockReady(blockId: string): Promise<void> {
         const startTime = Block.perfDebug ? performance.now() : 0
-        
+
         // Fast path: check in-process locks first (no Redis call needed)
         const lockCheckStart = Block.perfDebug ? performance.now() : 0
         const hasLock = Block.locks.has(blockId)
         if (Block.perfDebug) {
             console.log(`⏱️  [PERF][waitForBlockReady] locks.has check: ${(performance.now() - lockCheckStart).toFixed(2)}ms`)
         }
-        
+
         if (hasLock) {
             const lockWaitStart = Block.perfDebug ? performance.now() : 0
             await Block.locks.get(blockId)
             if (Block.perfDebug) {
                 console.log(`⏱️  [PERF][waitForBlockReady] await in-process lock: ${(performance.now() - lockWaitStart).toFixed(2)}ms`)
             }
-            
+
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
                 console.log(`⏱️  [PERF][waitForBlockReady] TOTAL (in-process lock): ${duration.toFixed(2)}ms`)
@@ -1791,7 +1806,7 @@ export class Block {
             if (Block.perfDebug) {
                 console.log(`⏱️  [PERF][waitForBlockReady] redis.exists (iteration ${waitIterations}): ${(performance.now() - redisRecheckStart).toFixed(2)}ms`)
             }
-            
+
             Block.lockStatusCache.set(blockId, {
                 isLocked: !!blockLockExists,
                 lastChecked: Date.now()
@@ -1896,7 +1911,7 @@ export class Block {
                 unlinkSync(filePath)
             }
         })
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] delete_block: ${duration.toFixed(2)}ms`)
@@ -1967,12 +1982,12 @@ export class Block {
         if (!queue) {
             throw new Error(`Failed to initialize queue for block ${blockId}. Redis status: ${Block.redis?.status}`)
         }
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] init_queue: ${duration.toFixed(2)}ms`)
         }
-        
+
         return queue
     }
 
@@ -2317,7 +2332,7 @@ export class Block {
         try {
             // Queue individual operation in Redis list
             const operationQueueKey = `block_operations:${blockId}`
-            
+
             const stringifyStart = Block.perfDebug ? performance.now() : 0
             const operationData = JSON.stringify({
                 operation,
@@ -2348,7 +2363,7 @@ export class Block {
                 if (Block.perfDebug) {
                     console.log(`⏱️  [PERF][queue_operation] get queue: ${(performance.now() - queueGetStart).toFixed(2)}ms`)
                 }
-                
+
                 if (queue) {
                     // Check if there's already a job waiting/processing
                     const getWaitingStart = Block.perfDebug ? performance.now() : 0
@@ -2356,7 +2371,7 @@ export class Block {
                     if (Block.perfDebug) {
                         console.log(`⏱️  [PERF][queue_operation] queue.getWaiting: ${(performance.now() - getWaitingStart).toFixed(2)}ms`)
                     }
-                    
+
                     const getActiveStart = Block.perfDebug ? performance.now() : 0
                     const active = await queue.getActive()
                     if (Block.perfDebug) {
@@ -2414,12 +2429,12 @@ export class Block {
                 return null
             }
         }).filter(op => op !== null)
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] getFailedOperations: ${duration.toFixed(2)}ms`)
         }
-        
+
         return result
     }
 
@@ -2551,7 +2566,7 @@ export class Block {
         }
 
         console.warn(`[Sharded] Shutdown timeout reached, ${Date.now() - startTime}ms elapsed`)
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - perfStartTime
             console.log(`⏱️  [PERF] gracefulShutdown: ${duration.toFixed(2)}ms`)
@@ -2581,7 +2596,7 @@ export class Block {
         }
 
         console.log('[Sharded] Triggered immediate batch processing for all blocks')
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] flushAllPendingBatches: ${duration.toFixed(2)}ms`)
@@ -3445,7 +3460,7 @@ export class Block {
             } else if (Block.debug && lockValue) {
                 console.log(`[Sharded] Block lock for ${blockId} owned by different process, not releasing`)
             }
-            
+
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
                 console.log(`⏱️  [PERF] invalidate: ${duration.toFixed(2)}ms`)
@@ -3517,7 +3532,7 @@ export class Block {
         } catch (error) {
             console.error('[Sharded] Error checking orphaned queues:', error)
         }
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] checkOrphanedQueues: ${duration.toFixed(2)}ms`)
@@ -3647,7 +3662,7 @@ export class Block {
             removeOnComplete: true,
             removeOnFail: false,
         })
-        
+
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] createEphemeralRecoveryWorker: ${duration.toFixed(2)}ms`)
@@ -4022,14 +4037,14 @@ export class Block {
                     // Remove failed jobs older than 1 hour (configurable)
                     const failed = await queue.getFailed(0, 100)
                     const oneHourAgo = Date.now() - 3600000
-                    
+
                     for (const job of failed) {
                         if (job.finishedOn && job.finishedOn < oneHourAgo) {
                             await job.remove()
                             cleaned.oldFailedJobs++
                         }
                     }
-                    
+
                     // Also clean completed jobs if any slipped through
                     const completed = await queue.getCompleted(0, 100)
                     for (const job of completed) {
@@ -4043,14 +4058,14 @@ export class Block {
             // 4. Clean up orphaned last_seen and block_ttl entries
             const lastSeenEntries = await Block.redis.hgetall('last_seen')
             const blockTtlEntries = await Block.redis.hgetall('block_ttl')
-            
+
             for (const blockId in lastSeenEntries) {
                 if (!Block.blockClients.has(blockId)) {
                     await Block.redis.hdel('last_seen', blockId)
                     cleaned.orphanedKeys++
                 }
             }
-            
+
             for (const blockId in blockTtlEntries) {
                 if (!Block.blockClients.has(blockId)) {
                     await Block.redis.hdel('block_ttl', blockId)
@@ -4060,7 +4075,7 @@ export class Block {
 
             const duration = Date.now() - startTime
             console.log(`[Sharded] Cleanup completed in ${duration}ms:`, cleaned)
-            
+
             return cleaned
         } catch (err) {
             console.error('[Sharded] Error during cleanup:', err)
@@ -4076,12 +4091,12 @@ export class Block {
         if (Block.debug) {
             console.log(`[Sharded] Starting periodic cleanup every ${intervalMs}ms`)
         }
-        
+
         // Run cleanup immediately
         Block.cleanup().catch(err => {
             console.error('[Sharded] Initial cleanup failed:', err)
         })
-        
+
         // Then run periodically
         return setInterval(() => {
             Block.cleanup().catch(err => {
