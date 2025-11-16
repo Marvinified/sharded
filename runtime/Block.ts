@@ -9,6 +9,7 @@ import { Prisma } from '@prisma/client'
 import { Queue, Worker, Job, ConnectionOptions } from 'bullmq'
 import crypto from 'crypto'
 import Redis from 'ioredis'
+import { PrismaBetterSQLite3 } from '@prisma/adapter-better-sqlite3'
 
 /**
  * Known Caveats:
@@ -282,7 +283,9 @@ export class Block {
                 }
             }
 
-            console.log(`[Sharded] ✓ Database path verified for ${blockId}: ${expectedPath}`)
+            if (Block.debug) {
+                console.log(`[Sharded] ✓ Database path verified for ${blockId}: ${expectedPath}`)
+            }
 
             if (Block.perfDebug) {
                 const duration = performance.now() - startTime
@@ -323,7 +326,7 @@ export class Block {
                 blockClient.$queryRaw`PRAGMA wal_autocheckpoint;`
             ])
 
-            return {
+            const result = {
                 blockId,
                 timestamp: new Date().toISOString(),
                 database_path: (dbList as any[]).find((db: any) => db.seq === 0)?.file,
@@ -343,6 +346,7 @@ export class Block {
                 const duration = performance.now() - startTime
                 console.log(`⏱️  [PERF] getWalDiagnostics: ${duration.toFixed(2)}ms`)
             }
+            return result
         } catch (err) {
             return {
                 blockId,
@@ -1263,16 +1267,18 @@ export class Block {
 
             // Use absolute path to ensure all processes connect to the same file
             const absoluteBlockPath = require('path').resolve(blockPath)
+            
+            // Create better-sqlite3 adapter
             // Note: Using mode=rwc (read-write-create) to allow WAL mode initialization
-            // File should already exist from template copy above
-            const connectionUrl = `file:${absoluteBlockPath}?mode=rwc&cache=private`
+            // cache=private ensures each connection has its own page cache
+            const adapter = new PrismaBetterSQLite3({
+                url: `file:${absoluteBlockPath}`,
+                readonly: false,
+                fileMustExist: false,
+            })
 
             const blockClient = new BlockPrismaClient({
-                datasources: {
-                    db: {
-                        url: connectionUrl,
-                    },
-                },
+                adapter,
                 ...config.prismaOptions,
             })
 
@@ -3797,7 +3803,9 @@ export class Block {
                         await Block.invalidate(blockId)
                         Block.redis?.hdel("last_seen", blockId)
                         Block.redis?.hdel("block_ttl", blockId)
-                        console.log('[Sharded] Invalidated block:', blockId)
+                        if (Block.debug) {
+                            console.log(`[Sharded] Invalidated block: ${blockId}`)
+                        }
                     } else {
                         // Extend grace period for active blocks
                         const graceTime = Date.now() - (blockTtl * 0.8)

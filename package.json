@@ -12,10 +12,11 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@prisma/client": "^6.7.0",
+    "@prisma/adapter-better-sqlite3": "^6.19.0",
+    "@prisma/client": "^6.19.0",
     "better-sqlite3": "^11.10.0",
     "bullmq": "^5.52.2",
-    "prisma": "^6.7.0"
+    "prisma": "^6.19.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
