@@ -1,10 +1,5 @@
 import { join } from 'path'
-import {
-    copyFileSync,
-    existsSync,
-    mkdirSync,
-    unlinkSync,
-} from 'fs'
+import { promises as fs } from 'fs'
 import { Prisma } from '@prisma/client'
 import { Queue, Worker, Job, ConnectionOptions } from 'bullmq'
 import crypto from 'crypto'
@@ -18,6 +13,12 @@ import { PrismaBetterSQLite3 } from '@prisma/adapter-better-sqlite3'
  * - FindMany operation will still call the main client, to get the latest data
  *     - Although after the fetch, each item will be cached in the block client, so call to retrieve any of the items will return the cached data
  * - aggregate, groupBy, count operations will still call the main client, to get the latest data
+ * 
+ * Memory Leak Prevention:
+ * - All block tracking data (Maps/Sets) are cleaned up when blocks are invalidated via cleanupBlockTracking()
+ * - Periodic cleanup() method removes orphaned entries for non-existent blocks
+ * - Use Block.watch() with cleanup interval to enable automatic memory management
+ * - Call Block.cleanup() manually in serverless environments to prevent memory accumulation
  */
 
 export type BlockConfig<T> = {
@@ -87,6 +88,18 @@ interface WatchOptions<T> {
 }
 
 export class Block {
+    /**
+     * Helper to check if a file exists (async)
+     */
+    private static async fileExists(path: string): Promise<boolean> {
+        try {
+            await fs.access(path)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private static blockClientsWithHooks = new Map<
         string,
         Prisma.DefaultPrismaClient
@@ -121,6 +134,9 @@ export class Block {
     private static ongoingRecoveryWorkers = new Set<string>()
     // Recovery main clients (separate from normal main clients to avoid conflicts)
     private static recoveryMainClients = new Map<string, Prisma.DefaultPrismaClient>()
+    // Watch workers and queues (for cleanup)
+    private static watchWorkers: Worker[] = []
+    private static watchQueues: Queue[] = []
     // Batch processing limits
     private static MAX_BATCH_SIZE = 500 // Increased significantly for better throughput
     private static MIN_BATCH_SIZE = 50 // Minimum batch size
@@ -1163,8 +1179,8 @@ export class Block {
                 const baseDir = join(process.cwd(), 'prisma', 'blocks')
                 const dataDir = join(baseDir, 'data')
 
-            if (!existsSync(dataDir)) {
-                mkdirSync(dataDir, { recursive: true })
+            if (!(await Block.fileExists(dataDir))) {
+                await fs.mkdir(dataDir, { recursive: true })
             }
 
             const generated_client = join(baseDir, 'generated', 'block')
@@ -1174,7 +1190,7 @@ export class Block {
 
             // Get the template SQLite database path
             const templatePath = join(baseDir, 'template.sqlite')
-            if (!existsSync(templatePath)) {
+            if (!(await Block.fileExists(templatePath))) {
                 throw new Error(
                     `Template SQLite database not found at ${templatePath}`,
                 )
@@ -1182,23 +1198,22 @@ export class Block {
 
             // Create buffer database path
             const blockPath = join(dataDir, `${config.blockId}.sqlite`)
-            let needsInitialLoad = !existsSync(blockPath)
+            let needsInitialLoad = !(await Block.fileExists(blockPath))
 
             // Check if existing file is corrupted (0 bytes or invalid)
-            if (!needsInitialLoad && existsSync(blockPath)) {
-                const fs = require('fs')
-                const stats = fs.statSync(blockPath)
+            if (!needsInitialLoad && (await Block.fileExists(blockPath))) {
+                const stats = await fs.stat(blockPath)
                 if (stats.size === 0) {
                     console.warn(`[Sharded] Detected corrupted/empty block file: ${blockPath}, will recreate from template`)
                     // Delete corrupted file and associated WAL files
                     try {
                         const suffixes = ['', '-shm', '-wal']
-                        suffixes.forEach(suffix => {
+                        for (const suffix of suffixes) {
                             const filePath = blockPath + suffix
-                            if (existsSync(filePath)) {
-                                unlinkSync(filePath)
+                            if (await Block.fileExists(filePath)) {
+                                await fs.unlink(filePath)
                             }
-                        })
+                        }
                         needsInitialLoad = true
                     } catch (err) {
                         console.error(`[Sharded] Failed to delete corrupted block file: ${blockPath}`, err)
@@ -1235,16 +1250,15 @@ export class Block {
                 }
 
                 // Double-check if file still doesn't exist after acquiring lock
-                if (!existsSync(blockPath)) {
+                if (!(await Block.fileExists(blockPath))) {
                     if (Block.debug) {
                         console.log('[Sharded] Creating SQLite file from template:', blockPath)
                     }
-                    copyFileSync(templatePath, blockPath)
+                    await fs.copyFile(templatePath, blockPath)
 
                     // Verify the copy was successful
-                    const fs = require('fs')
-                    const copiedStats = fs.statSync(blockPath)
-                    const templateStats = fs.statSync(templatePath)
+                    const copiedStats = await fs.stat(blockPath)
+                    const templateStats = await fs.stat(templatePath)
                     if (copiedStats.size === 0 || copiedStats.size !== templateStats.size) {
                         throw new Error(`Failed to copy template database: copied file size (${copiedStats.size}) doesn't match template (${templateStats.size})`)
                     }
@@ -1908,15 +1922,15 @@ export class Block {
         const blockPath = join(baseDir, `${blockId}.sqlite`)
         // Delete SQLite database files using glob pattern
         const suffixes = ['', '-shm', '-wal']
-        suffixes.forEach(suffix => {
+        for (const suffix of suffixes) {
             const filePath = blockPath + suffix
             if (Block.debug) {
                 console.log('[Sharded] Deleting block file:', filePath)
             }
-            if (existsSync(filePath)) {
-                unlinkSync(filePath)
+            if (await Block.fileExists(filePath)) {
+                await fs.unlink(filePath)
             }
-        })
+        }
 
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
@@ -2518,7 +2532,97 @@ export class Block {
     }
 
     /**
+     * Clean up all tracking data structures for a specific block to prevent memory leaks
+     * This should be called whenever a block is removed/invalidated
+     * NOTE: Prisma clients must be disconnected BEFORE calling this method
+     */
+    private static async cleanupBlockTracking(blockId: string): Promise<void> {
+        // Disconnect Prisma clients BEFORE deleting from maps to prevent connection leaks
+        const blockClient = Block.blockClients.get(blockId)
+        const blockClientWithHooks = Block.blockClientsWithHooks.get(blockId)
+        const mainClient = Block.mainClients.get(blockId)
+        const recoveryClient = Block.recoveryMainClients.get(blockId)
+        
+        // Disconnect all Prisma clients gracefully
+        if (blockClient) {
+            try {
+                await blockClient.$disconnect()
+                if (Block.debug) {
+                    console.log(`[Sharded] Disconnected block client for ${blockId}`)
+                }
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting block client for ${blockId}:`, err)
+            }
+        }
+        
+        if (blockClientWithHooks && blockClientWithHooks !== blockClient) {
+            try {
+                await blockClientWithHooks.$disconnect()
+                if (Block.debug) {
+                    console.log(`[Sharded] Disconnected block client with hooks for ${blockId}`)
+                }
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting block client with hooks for ${blockId}:`, err)
+            }
+        }
+        
+        if (mainClient) {
+            try {
+                await mainClient.$disconnect()
+                if (Block.debug) {
+                    console.log(`[Sharded] Disconnected main client for ${blockId}`)
+                }
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting main client for ${blockId}:`, err)
+            }
+        }
+        
+        if (recoveryClient && recoveryClient !== mainClient) {
+            try {
+                await recoveryClient.$disconnect()
+                if (Block.debug) {
+                    console.log(`[Sharded] Disconnected recovery client for ${blockId}`)
+                }
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting recovery client for ${blockId}:`, err)
+            }
+        }
+        
+        // Core client/queue tracking
+        Block.blockClients.delete(blockId)
+        Block.blockClientsWithHooks.delete(blockId)
+        Block.mainClients.delete(blockId)
+        Block.blockQueues.delete(blockId)
+        Block.blockWorkers.delete(blockId)
+        Block.blockLoaders.delete(blockId)
+        
+        // WAL and checkpoint tracking
+        Block.skipCheckpointBlocks.delete(blockId)
+        
+        // Lock and cache tracking
+        Block.lockStatusCache.delete(blockId)
+        Block.locks.delete(blockId)
+        Block.activeWriteOperations.delete(blockId)
+        Block.invalidatingBlocks.delete(blockId)
+        
+        // Performance and throttling tracking
+        Block.lastSeenUpdateTimes.delete(blockId)
+        Block.batchPerformanceHistory.delete(blockId)
+        Block.batchSizeLastExplored.delete(blockId)
+        Block.batchSizeLastLogged.delete(blockId)
+        
+        // Recovery tracking
+        Block.ongoingRecoveryWorkers.delete(blockId)
+        Block.recoveryMainClients.delete(blockId)
+        
+        if (Block.debug) {
+            console.log(`[Sharded] Cleaned up all tracking data for block ${blockId}`)
+        }
+    }
+
+    /**
      * Gracefully wait for all pending operations to complete before shutdown
+     * Closes all connections and releases all resources
      */
     static async gracefulShutdown(timeoutMs: number = 10000): Promise<void> {
         const perfStartTime = Block.perfDebug ? performance.now() : 0
@@ -2563,15 +2667,76 @@ export class Block {
             }
 
             if (totalPending === 0) {
-                console.log('[Sharded] All operations completed, shutdown ready')
-                return
+                console.log('[Sharded] All operations completed')
+                break
             }
 
             console.log(`[Sharded] Waiting for ${totalPending} pending operations...`)
             await new Promise(resolve => setTimeout(resolve, 500))
         }
 
-        console.warn(`[Sharded] Shutdown timeout reached, ${Date.now() - startTime}ms elapsed`)
+        if (Date.now() - startTime >= timeoutMs) {
+            console.warn(`[Sharded] Shutdown timeout reached, ${Date.now() - startTime}ms elapsed`)
+        }
+
+        // Close all workers and queues
+        console.log('[Sharded] Closing all workers and queues...')
+        for (const [blockId, worker] of Block.blockWorkers.entries()) {
+            try {
+                worker.removeAllListeners()
+                await worker.close()
+            } catch (err) {
+                console.error(`[Sharded] Error closing worker ${blockId}:`, err)
+            }
+        }
+
+        for (const [blockId, queue] of Block.blockQueues.entries()) {
+            try {
+                queue.removeAllListeners()
+                await queue.close()
+            } catch (err) {
+                console.error(`[Sharded] Error closing queue ${blockId}:`, err)
+            }
+        }
+
+        // Disconnect all Prisma clients
+        console.log('[Sharded] Disconnecting all Prisma clients...')
+        for (const [blockId, client] of Block.blockClients.entries()) {
+            try {
+                await client.$disconnect()
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting block client ${blockId}:`, err)
+            }
+        }
+
+        for (const [blockId, client] of Block.blockClientsWithHooks.entries()) {
+            try {
+                await client.$disconnect()
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting block client with hooks ${blockId}:`, err)
+            }
+        }
+
+        for (const [blockId, client] of Block.mainClients.entries()) {
+            try {
+                await client.$disconnect()
+            } catch (err) {
+                console.error(`[Sharded] Error disconnecting main client ${blockId}:`, err)
+            }
+        }
+
+        // Disconnect Redis
+        if (Block.redis) {
+            console.log('[Sharded] Disconnecting Redis...')
+            try {
+                await Block.redis.quit()
+                Block.redis = null
+            } catch (err) {
+                console.error('[Sharded] Error disconnecting Redis:', err)
+            }
+        }
+
+        console.log('[Sharded] Graceful shutdown completed')
 
         if (Block.perfDebug) {
             const duration = performance.now() - perfStartTime
@@ -3414,25 +3579,19 @@ export class Block {
             const queue = Block.blockQueues.get(blockId)
             const worker = Block.blockWorkers.get(blockId)
 
-            // Remove from maps atomically
-            Block.blockClients.delete(blockId)
-            Block.blockClientsWithHooks.delete(blockId)
-            Block.mainClients.delete(blockId)
-            Block.blockQueues.delete(blockId)
-            Block.blockWorkers.delete(blockId)
-            Block.blockLoaders.delete(blockId)
-
-            // Close resources
+            // Close resources and remove event listeners to prevent memory leaks
             if (worker) {
                 if (Block.debug) {
                     console.log('[Sharded] Closing worker:', blockId)
                 }
+                worker.removeAllListeners()
                 await worker.close()
             }
 
             // Close queue if it exists
             if (queue) {
                 try {
+                    queue.removeAllListeners()
                     await queue.close()
                 } catch (err) {
                     if (Block.debug) {
@@ -3440,6 +3599,9 @@ export class Block {
                     }
                 }
             }
+
+            // Remove from all maps and tracking structures (includes Prisma disconnection)
+            await Block.cleanupBlockTracking(blockId)
 
             // Delete files last
             await Block.delete_block(blockId)
@@ -3754,6 +3916,9 @@ export class Block {
         await syncQueue.waitUntilReady()
         await cleanupQueue.waitUntilReady()
 
+        // Track queues for cleanup
+        Block.watchQueues.push(invalidationQueue, syncQueue, cleanupQueue)
+
         // Schedule invalidation checks (default: every 10 seconds)
         await invalidationQueue.upsertJobScheduler("check-invalidation-every", {
             every: options.intervals?.invalidation ?? 10000,
@@ -3786,7 +3951,7 @@ export class Block {
 
 
         // Worker for TTL-based invalidation checks (runs every 10 seconds by default)
-        new Worker(invalidationQueue.name, async (job: Job<{ ttl?: number }>) => {
+        const invalidationWorker = new Worker(invalidationQueue.name, async (job: Job<{ ttl?: number }>) => {
             if (Block.debug) {
                 console.log('[Sharded] checking TTL-based invalidation')
             }
@@ -3870,8 +4035,11 @@ export class Block {
             },
         })
 
+        // Track the invalidation worker
+        Block.watchWorkers.push(invalidationWorker)
+
         // Worker for sync worker management (runs every 2 seconds by default for responsive sync)
-        new Worker(syncQueue.name, async (job: Job) => {
+        const syncWorker = new Worker(syncQueue.name, async (job: Job) => {
             if (Block.debug) {
                 console.log('[Sharded] checking sync worker management')
             }
@@ -3959,9 +4127,12 @@ export class Block {
             },
         })
 
+        // Track the sync worker
+        Block.watchWorkers.push(syncWorker)
+
         // Worker for Redis cleanup (runs at configured interval, default: every 1 hour)
         if (cleanupInterval > 0) {
-            new Worker(cleanupQueue.name, async (job: Job) => {
+            const cleanupWorker = new Worker(cleanupQueue.name, async (job: Job) => {
                 if (Block.debug) {
                     console.log('[Sharded] Running Redis cleanup')
                 }
@@ -3988,12 +4159,49 @@ export class Block {
                     enableOfflineQueue: true,
                 },
             })
+
+            // Track the cleanup worker
+            Block.watchWorkers.push(cleanupWorker)
         }
 
         if (Block.perfDebug) {
             const duration = performance.now() - startTime
             console.log(`⏱️  [PERF] watch: ${duration.toFixed(2)}ms`)
         }
+    }
+
+    /**
+     * Stop all watch workers and close watch queues
+     * Call this to cleanly shut down the watch() background processes
+     */
+    static async stopWatch(): Promise<void> {
+        console.log('[Sharded] Stopping watch workers and queues...')
+
+        // Close all watch workers
+        for (const worker of Block.watchWorkers) {
+            try {
+                worker.removeAllListeners()
+                await worker.close()
+            } catch (err) {
+                console.error('[Sharded] Error closing watch worker:', err)
+            }
+        }
+
+        // Close all watch queues
+        for (const queue of Block.watchQueues) {
+            try {
+                queue.removeAllListeners()
+                await queue.close()
+            } catch (err) {
+                console.error('[Sharded] Error closing watch queue:', err)
+            }
+        }
+
+        // Clear the arrays
+        Block.watchWorkers = []
+        Block.watchQueues = []
+
+        console.log('[Sharded] Watch stopped successfully')
     }
 
     /**
@@ -4077,6 +4285,74 @@ export class Block {
             for (const blockId in blockTtlEntries) {
                 if (!Block.blockClients.has(blockId)) {
                     await Block.redis.hdel('block_ttl', blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+
+            // 5. Clean up orphaned in-memory tracking data for non-existent blocks
+            // This prevents memory leaks from blocks that were removed without proper cleanup
+            const activeBlockIds = new Set(Block.blockClients.keys())
+            
+            // Clean up tracking structures for blocks that no longer exist
+            for (const blockId of Block.skipCheckpointBlocks) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.skipCheckpointBlocks.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.lockStatusCache.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.lockStatusCache.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.lastSeenUpdateTimes.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.lastSeenUpdateTimes.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.batchPerformanceHistory.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.batchPerformanceHistory.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.batchSizeLastExplored.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.batchSizeLastExplored.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.batchSizeLastLogged.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.batchSizeLastLogged.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.activeWriteOperations.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.activeWriteOperations.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.ongoingRecoveryWorkers) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.ongoingRecoveryWorkers.delete(blockId)
+                    cleaned.orphanedKeys++
+                }
+            }
+            
+            for (const blockId of Block.recoveryMainClients.keys()) {
+                if (!activeBlockIds.has(blockId)) {
+                    Block.recoveryMainClients.delete(blockId)
                     cleaned.orphanedKeys++
                 }
             }
